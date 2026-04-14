@@ -1,0 +1,45 @@
+# PlatformIO build output
+.pio/
+
+# ESP-IDF native build (cmake / idf.py)
+build/
+
+# Generated KConfig — one file per active environment, not committed
+sdkconfig
+sdkconfig.*
+
+# IDE — VS Code (auto-generated, machine-specific)
+.vscode/
+.idea/
+
+# Binaries and build artifacts
+*.o
+*.a
+*.so
+*.elf
+*.bin
+
+# Editor temp files
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+.DS_Store?
+
+# Python/Virtual environments
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Environment variables
+.env
+.env.local
+
+# Claude Code session files
+*.claude
+.claude/
