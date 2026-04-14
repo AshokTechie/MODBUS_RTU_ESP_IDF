@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stdbool.h>
 
 #define APP_CONFIG_STR_LEN 128
 
@@ -18,5 +19,6 @@ typedef struct {
 
 esp_err_t app_config_load_azure(app_config_azure_t *out_cfg);
 esp_err_t app_config_save_azure(const app_config_azure_t *cfg);
+bool app_config_validate_azure(const app_config_azure_t *cfg);
 esp_err_t app_config_load_runtime(app_runtime_config_t *out_cfg);
 esp_err_t app_config_save_runtime(const app_runtime_config_t *cfg);

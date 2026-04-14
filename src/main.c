@@ -182,10 +182,9 @@ static void telemetry_task(void *arg)
     for (;;) {
         int interval = s_runtime_cfg.telemetry_interval_sec > 0 ? s_runtime_cfg.telemetry_interval_sec : 30;
         if (build_status_json(payload, sizeof(payload)) == ESP_OK) {
-            if (azure_iot_is_connected()) {
-                azure_iot_publish_telemetry(payload);
-            } else {
-                ESP_LOGI(TAG, "%s", payload);
+            ESP_LOGI(TAG, "%s", payload);
+            if (azure_iot_is_connected() && azure_iot_publish_telemetry(payload) != ESP_OK) {
+                ESP_LOGW(TAG, "Telemetry publish failed");
             }
         }
         vTaskDelay(pdMS_TO_TICKS(interval * 1000));
@@ -231,17 +230,35 @@ void app_main(void)
     app_config_azure_t azure_cfg = {0};
     app_config_load_runtime(&s_runtime_cfg);
 
-    if (app_config_load_azure(&azure_cfg) == ESP_OK && wifi_mgr_is_connected()) {
-        ESP_ERROR_CHECK(azure_iot_init(&azure_cfg, &s_runtime_cfg));
-        azure_iot_register_twin_callback(on_twin_update);
-        azure_iot_register_method_callback(smartload_method_handler);
-        if (azure_iot_connect() == ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            azure_iot_request_twin();
-            azure_iot_start_background_task();
+    esp_err_t azure_err = app_config_load_azure(&azure_cfg);
+    if (azure_err != ESP_OK) {
+        ESP_LOGW(TAG, "Azure credentials load failed: %s", esp_err_to_name(azure_err));
+    } else if (!app_config_validate_azure(&azure_cfg)) {
+        ESP_LOGW(TAG, "Azure credentials are invalid or incomplete");
+        azure_err = ESP_ERR_INVALID_STATE;
+    }
+
+    if (azure_err == ESP_OK && wifi_mgr_is_connected()) {
+        esp_err_t init_err = azure_iot_init(&azure_cfg, &s_runtime_cfg);
+        if (init_err != ESP_OK) {
+            ESP_LOGW(TAG, "Azure IoT init failed: %s", esp_err_to_name(init_err));
+        } else {
+            azure_iot_register_twin_callback(on_twin_update);
+            azure_iot_register_method_callback(smartload_method_handler);
+            esp_err_t conn_err = azure_iot_connect();
+            if (conn_err != ESP_OK) {
+                ESP_LOGW(TAG, "Azure IoT connect failed: %s", esp_err_to_name(conn_err));
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                azure_iot_request_twin();
+                azure_iot_start_background_task();
+                ESP_LOGI(TAG, "Azure IoT connected and initialized");
+            }
         }
-    } else {
-        ESP_LOGW(TAG, "Azure credentials missing or Wi-Fi offline, running local-only");
+    } else if (azure_err != ESP_OK) {
+        ESP_LOGW(TAG, "Azure credentials missing, running local-only");
+    } else if (!wifi_mgr_is_connected()) {
+        ESP_LOGW(TAG, "Wi-Fi offline, Azure IoT features unavailable");
     }
 
     xTaskCreate(telemetry_task, "telemetry_task", 6144, NULL, 4, NULL);

@@ -5,12 +5,18 @@
 #include "nvs.h"
 #include "storage.h"
 
+#include <dirent.h>
 #include <stdio.h>
 #include <string.h>
 
 static const char *TAG = "app_config";
 
 static esp_err_t parse_azure_json(const char *json, size_t json_len, app_config_azure_t *out_cfg);
+static esp_err_t scan_mount_for_azure(const char *mount, app_config_azure_t *out_cfg);
+
+#define MQTT_CONFIG_FILE   "/mqtt_config.json"
+#define AZURE_CONFIG_FILE  "/azure_config.json"
+#define LEGACY_CONFIG_FILE "/config.json"
 
 static esp_err_t read_json_from_mount(const char *mount, const char *path, char *buf, size_t buf_size, size_t *out_len)
 {
@@ -158,6 +164,22 @@ static esp_err_t save_json_blob(const char *path, const char *json)
     return storage_write(path, json);
 }
 
+static void save_azure_to_nvs(const app_config_azure_t *cfg)
+{
+    if (!cfg) {
+        return;
+    }
+
+    nvs_handle_t nvs;
+    if (nvs_open("smartload", NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_str(nvs, "az_host", cfg->hostname);
+        nvs_set_str(nvs, "az_dev", cfg->device_id);
+        nvs_set_str(nvs, "az_sak", cfg->shared_access_key);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+}
+
 esp_err_t app_config_load_azure(app_config_azure_t *out_cfg)
 {
     if (!out_cfg) {
@@ -165,6 +187,51 @@ esp_err_t app_config_load_azure(app_config_azure_t *out_cfg)
     }
 
     memset(out_cfg, 0, sizeof(*out_cfg));
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+
+    if (storage_sd_is_available()) {
+        err = load_azure_from_path(STORAGE_SD_MOUNT, MQTT_CONFIG_FILE, out_cfg);
+        if (err == ESP_OK) {
+            save_azure_to_nvs(out_cfg);
+            return ESP_OK;
+        }
+
+        err = load_azure_from_path(STORAGE_SD_MOUNT, AZURE_CONFIG_FILE, out_cfg);
+        if (err == ESP_OK) {
+            save_azure_to_nvs(out_cfg);
+            return ESP_OK;
+        }
+
+        err = load_azure_from_path(STORAGE_SD_MOUNT, LEGACY_CONFIG_FILE, out_cfg);
+        if (err == ESP_OK) {
+            save_azure_to_nvs(out_cfg);
+            return ESP_OK;
+        }
+
+        err = scan_mount_for_azure(STORAGE_SD_MOUNT, out_cfg);
+        if (err == ESP_OK) {
+            save_azure_to_nvs(out_cfg);
+            return ESP_OK;
+        }
+    }
+
+    err = load_azure_from_path(STORAGE_SPIFFS_MOUNT, MQTT_CONFIG_FILE, out_cfg);
+    if (err == ESP_OK) {
+        save_azure_to_nvs(out_cfg);
+        return ESP_OK;
+    }
+
+    err = load_azure_from_path(STORAGE_SPIFFS_MOUNT, AZURE_CONFIG_FILE, out_cfg);
+    if (err == ESP_OK) {
+        save_azure_to_nvs(out_cfg);
+        return ESP_OK;
+    }
+
+    err = load_azure_from_path(STORAGE_SPIFFS_MOUNT, LEGACY_CONFIG_FILE, out_cfg);
+    if (err == ESP_OK) {
+        save_azure_to_nvs(out_cfg);
+        return ESP_OK;
+    }
 
     nvs_handle_t nvs;
     if (nvs_open("smartload", NVS_READONLY, &nvs) == ESP_OK) {
@@ -182,31 +249,8 @@ esp_err_t app_config_load_azure(app_config_azure_t *out_cfg)
         }
     }
 
-    esp_err_t err = load_azure_from_path(STORAGE_SPIFFS_MOUNT, "/azure_config.json", out_cfg);
-    if (err == ESP_OK) {
-        return ESP_OK;
-    }
-
-    if (storage_sd_is_available()) {
-        err = load_azure_from_path(STORAGE_SD_MOUNT, "/azure_config.json", out_cfg);
-        if (err == ESP_OK) {
-            return ESP_OK;
-        }
-    }
-
-    err = load_azure_from_path(STORAGE_SPIFFS_MOUNT, "/config.json", out_cfg);
-    if (err == ESP_OK) {
-        return ESP_OK;
-    }
-
-    if (storage_sd_is_available()) {
-        err = load_azure_from_path(STORAGE_SD_MOUNT, "/config.json", out_cfg);
-        if (err == ESP_OK) {
-            return ESP_OK;
-        }
-    }
-
-    ESP_LOGW(TAG, "Azure config not found in NVS, /azure_config.json, or /config.json");
+    ESP_LOGW(TAG, "Azure config not found in NVS, %s, %s, or %s",
+             MQTT_CONFIG_FILE, AZURE_CONFIG_FILE, LEGACY_CONFIG_FILE);
     return ESP_ERR_NOT_FOUND;
 }
 
@@ -229,7 +273,71 @@ esp_err_t app_config_save_azure(const app_config_azure_t *cfg)
     snprintf(json, sizeof(json),
              "{\"hostname\":\"%s\",\"device_id\":\"%s\",\"shared_access_key\":\"%s\"}",
              cfg->hostname, cfg->device_id, cfg->shared_access_key);
-    return save_json_blob("/azure_config.json", json);
+    esp_err_t err = save_json_blob(MQTT_CONFIG_FILE, json);
+    if (err == ESP_OK) {
+        save_json_blob(AZURE_CONFIG_FILE, json);
+    }
+    return err;
+}
+
+static bool has_json_like_extension(const char *name)
+{
+    if (!name) {
+        return false;
+    }
+
+    const char *dot = strrchr(name, '.');
+    if (!dot) {
+        return false;
+    }
+
+    return strcasecmp(dot, ".json") == 0 || strcasecmp(dot, ".jso") == 0;
+}
+
+static esp_err_t scan_mount_for_azure(const char *mount, app_config_azure_t *out_cfg)
+{
+    DIR *dir = opendir(mount);
+    if (!dir) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (!has_json_like_extension(entry->d_name)) {
+            continue;
+        }
+
+        char path[160];
+        size_t name_len = strnlen(entry->d_name, sizeof(path));
+        if (name_len + 2 > sizeof(path)) {
+            continue;
+        }
+        path[0] = '/';
+        memcpy(&path[1], entry->d_name, name_len);
+        path[name_len + 1] = '\0';
+        esp_err_t err = load_azure_from_path(mount, path, out_cfg);
+        if (err == ESP_OK) {
+            closedir(dir);
+            return ESP_OK;
+        }
+    }
+
+    closedir(dir);
+    return ESP_ERR_NOT_FOUND;
+}
+
+bool app_config_validate_azure(const app_config_azure_t *cfg)
+{
+    if (!cfg) {
+        return false;
+    }
+
+    return cfg->hostname[0] != '\0' &&
+           cfg->device_id[0] != '\0' &&
+           cfg->shared_access_key[0] != '\0';
 }
 
 esp_err_t app_config_load_runtime(app_runtime_config_t *out_cfg)
