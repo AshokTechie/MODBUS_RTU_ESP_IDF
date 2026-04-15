@@ -3,15 +3,19 @@
 #include "app_config.h"
 #include "cJSON.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mqtt_mgr.h"
 #include "ota.h"
 #include "sas_token.h"
+#include "storage.h"
 #include "wifi_mgr.h"
 
+#include <dirent.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 static const char *TAG = "azure_iot";
@@ -31,6 +35,87 @@ static struct {
 static TaskHandle_t s_bg_task = NULL;
 static azure_iot_twin_cb_t s_twin_cb = NULL;
 static azure_iot_method_cb_t s_method_cb = NULL;
+
+static esp_err_t build_sd_file_list_json(char *out, size_t out_size)
+{
+    if (!storage_sd_is_available()) {
+        snprintf(out, out_size, "{\"status\":\"sd_unavailable\"}");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    DIR *dir = opendir(STORAGE_SD_MOUNT);
+    if (!dir) {
+        snprintf(out, out_size, "{\"status\":\"open_failed\"}");
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *files = cJSON_AddArrayToObject(root, "files");
+    struct dirent *entry = NULL;
+    int count = 0;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        cJSON_AddItemToArray(files, cJSON_CreateString(entry->d_name));
+        count++;
+    }
+    closedir(dir);
+
+    cJSON_AddStringToObject(root, "status", "ok");
+    cJSON_AddNumberToObject(root, "count", count);
+
+    bool ok = cJSON_PrintPreallocated(root, out, out_size, false);
+    cJSON_Delete(root);
+    return ok ? ESP_OK : ESP_ERR_INVALID_SIZE;
+}
+
+static esp_err_t clear_sd_root(bool preserve_config, int *removed_count)
+{
+    if (removed_count) {
+        *removed_count = 0;
+    }
+    if (!storage_sd_is_available()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    DIR *dir = opendir(STORAGE_SD_MOUNT);
+    if (!dir) {
+        return ESP_FAIL;
+    }
+
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        if (preserve_config) {
+            if (strcasecmp(entry->d_name, "wifi.txt") == 0 ||
+                strcasecmp(entry->d_name, "wifi.json") == 0 ||
+                strcasecmp(entry->d_name, "config.json") == 0 ||
+                strcasecmp(entry->d_name, "mqtt_config.json") == 0 ||
+                strcasecmp(entry->d_name, "azure_config.json") == 0 ||
+                strcasecmp(entry->d_name, "update.bin") == 0) {
+                continue;
+            }
+        }
+
+        char full_path[192];
+        int written = snprintf(full_path, sizeof(full_path), "%s/%s", STORAGE_SD_MOUNT, entry->d_name);
+        if (written <= 0 || (size_t)written >= sizeof(full_path)) {
+            continue;
+        }
+
+        if (remove(full_path) == 0 && removed_count) {
+            (*removed_count)++;
+        }
+    }
+
+    closedir(dir);
+    return ESP_OK;
+}
 
 static void send_method_response(const char *rid, int status, const char *payload)
 {
@@ -119,6 +204,13 @@ static void handle_direct_method(const char *topic, int topic_len, const char *d
     memcpy(payload, data, copy);
     payload[copy] = '\0';
 
+    if (strcmp(method, "reboot") == 0) {
+        send_method_response(rid, 200, "{\"response\":\"Rebooting\"}");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_restart();
+        return;
+    }
+
     if (strcmp(method, "ota") == 0) {
         cJSON *root = cJSON_ParseWithLength(payload, copy);
         cJSON *url = root ? cJSON_GetObjectItem(root, "url") : NULL;
@@ -136,6 +228,57 @@ static void handle_direct_method(const char *topic, int topic_len, const char *d
             }
         }
         if (root) cJSON_Delete(root);
+        return;
+    }
+
+    if (strcmp(method, "spiffs_health") == 0) {
+        storage_spiffs_health_t h = storage_spiffs_health();
+        snprintf(response, sizeof(response),
+                 "{\"status\":\"%s\",\"total_kb\":%u,\"used_kb\":%u,\"free_kb\":%u}",
+                 h.err == ESP_OK ? "ok" : "fail",
+                 (unsigned)(h.total_bytes / 1024),
+                 (unsigned)(h.used_bytes / 1024),
+                 (unsigned)((h.total_bytes - h.used_bytes) / 1024));
+        send_method_response(rid, h.err == ESP_OK ? 200 : 500, response);
+        return;
+    }
+
+    if (strcmp(method, "sd_health") == 0) {
+        storage_sd_health_t h = storage_sd_health();
+        snprintf(response, sizeof(response),
+                 "{\"status\":\"%s\",\"write\":%s,\"read\":%s,\"match\":%s}",
+                 h.err == ESP_OK ? "ok" : "fail",
+                 h.write_ok ? "true" : "false",
+                 h.read_ok ? "true" : "false",
+                 h.match_ok ? "true" : "false");
+        send_method_response(rid, h.err == ESP_OK ? 200 : 500, response);
+        return;
+    }
+
+    if (strcmp(method, "read_sd_files") == 0) {
+        esp_err_t err = build_sd_file_list_json(response, sizeof(response));
+        send_method_response(rid, err == ESP_OK ? 200 : 500, response);
+        return;
+    }
+
+    if (strcmp(method, "clear_sd") == 0) {
+        bool preserve_config = true;
+        cJSON *root = cJSON_ParseWithLength(payload, copy);
+        if (root) {
+            cJSON *item = cJSON_GetObjectItem(root, "preserve_config");
+            if (cJSON_IsBool(item)) {
+                preserve_config = cJSON_IsTrue(item);
+            }
+            cJSON_Delete(root);
+        }
+        int removed = 0;
+        esp_err_t err = clear_sd_root(preserve_config, &removed);
+        snprintf(response, sizeof(response),
+                 "{\"response\":\"%s\",\"removed\":%d,\"preserve_config\":%s}",
+                 err == ESP_OK ? "sd_cleared" : "sd_clear_failed",
+                 removed,
+                 preserve_config ? "true" : "false");
+        send_method_response(rid, err == ESP_OK ? 200 : 500, response);
         return;
     }
 
@@ -185,6 +328,9 @@ static void mqtt_event_bridge(const mqtt_mgr_event_t *event, void *user_ctx)
     (void)user_ctx;
     if (event->type == MQTT_MGR_EVENT_CONNECTED) {
         s.connected = true;
+        ESP_LOGI(TAG, "MQTT connected: device_id=%s device_name=%s",
+                 s.creds.device_id,
+                 s.runtime_cfg.device_name[0] ? s.runtime_cfg.device_name : "<unset>");
         mqtt_mgr_subscribe("$iothub/twin/res/#", 1);
         mqtt_mgr_subscribe("$iothub/twin/PATCH/properties/desired/#", 1);
         mqtt_mgr_subscribe("$iothub/methods/POST/#", 1);
@@ -234,6 +380,10 @@ esp_err_t azure_iot_init(const app_config_azure_t *creds, const app_runtime_conf
              "%s/%s/?api-version=2021-04-12", s.creds.hostname, s.creds.device_id);
     snprintf(s.telemetry_topic, sizeof(s.telemetry_topic),
              "devices/%s/messages/events/", s.creds.device_id);
+    ESP_LOGI(TAG, "Azure init: device_id=%s device_name=%s host=%s",
+             s.creds.device_id,
+             s.runtime_cfg.device_name[0] ? s.runtime_cfg.device_name : "<unset>",
+             s.creds.hostname);
     return ESP_OK;
 }
 

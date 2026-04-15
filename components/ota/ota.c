@@ -1,6 +1,7 @@
 #include "ota.h"
 
 #include "esp_app_desc.h"
+#include "esp_ota_ops.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
@@ -9,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -25,8 +27,28 @@ bool ota_parse_version(const char *str, int parts[4])
     if (!str || !str[0]) {
         return false;
     }
+
     parts[0] = parts[1] = parts[2] = parts[3] = 0;
-    return sscanf(str, "%d.%d.%d.%d", &parts[0], &parts[1], &parts[2], &parts[3]) > 0;
+    int count = 0;
+    const char *p = str;
+
+    while (*p && count < 4) {
+        while (*p && !isdigit((unsigned char)*p)) {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+
+        int value = 0;
+        while (isdigit((unsigned char)*p)) {
+            value = (value * 10) + (*p - '0');
+            p++;
+        }
+        parts[count++] = value;
+    }
+
+    return count > 0;
 }
 
 int ota_cmp_version(const int a[4], const int b[4])
@@ -47,6 +69,7 @@ void ota_get_current_version(char *buf, size_t buflen)
 static void ota_task(void *arg)
 {
     ota_args_t *args = (ota_args_t *)arg;
+    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
     esp_http_client_config_t http_cfg = {
         .url = args->url,
         .crt_bundle_attach = esp_crt_bundle_attach,
@@ -57,11 +80,51 @@ static void ota_task(void *arg)
         .http_config = &http_cfg,
     };
 
-    esp_err_t err = esp_https_ota(&ota_cfg);
+    ESP_LOGI(TAG, "OTA init: url=%s target_version=%s", args->url,
+             args->version[0] ? args->version : "<unspecified>");
+    if (next) {
+        ESP_LOGI(TAG, "OTA target partition: label=%s size=%lu bytes",
+                 next->label, (unsigned long)next->size);
+    }
+
+    esp_https_ota_handle_t handle = NULL;
+    esp_err_t err = esp_https_ota_begin(&ota_cfg, &handle);
+    if (err == ESP_OK) {
+        int last_logged_kb = -1;
+        while ((err = esp_https_ota_perform(handle)) == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+            int bytes = esp_https_ota_get_image_len_read(handle);
+            int kb = bytes / 1024;
+            if (kb != last_logged_kb && (kb == 0 || kb - last_logged_kb >= 64)) {
+                ESP_LOGI(TAG, "OTA progress: downloaded=%d bytes (%d KB)", bytes, kb);
+                last_logged_kb = kb;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+
+        if (err == ESP_OK) {
+            bool complete = esp_https_ota_is_complete_data_received(handle);
+            ESP_LOGI(TAG, "OTA download complete: bytes=%d complete=%s",
+                     esp_https_ota_get_image_len_read(handle), complete ? "true" : "false");
+        } else {
+            ESP_LOGE(TAG, "OTA perform failed after %d bytes: %s",
+                     esp_https_ota_get_image_len_read(handle), esp_err_to_name(err));
+            if (next) {
+                ESP_LOGE(TAG, "OTA target partition capacity: %lu bytes",
+                         (unsigned long)next->size);
+            }
+        }
+
+        esp_err_t finish_err = esp_https_ota_finish(handle);
+        if (err == ESP_OK) {
+            err = finish_err;
+        } else if (finish_err != ESP_OK) {
+            ESP_LOGW(TAG, "OTA finish also failed: %s", esp_err_to_name(finish_err));
+        }
+    }
     free(args);
 
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "OTA complete, restarting");
+        ESP_LOGI(TAG, "OTA complete, rebooting into new firmware");
         esp_restart();
     } else {
         ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(err));
@@ -90,9 +153,21 @@ esp_err_t ota_start(const char *url, const char *target_version)
         int cur[4];
         int tgt[4];
         ota_get_current_version(current, sizeof(current));
-        if (ota_parse_version(current, cur) && ota_parse_version(target_version, tgt) &&
-            ota_cmp_version(tgt, cur) <= 0) {
-            return OTA_ERR_NOT_NEWER;
+        ESP_LOGI(TAG, "OTA request: current_version=%s target_version=%s", current, target_version);
+        bool current_ok = ota_parse_version(current, cur);
+        bool target_ok = ota_parse_version(target_version, tgt);
+        if (current_ok && target_ok) {
+            int cmp = ota_cmp_version(tgt, cur);
+            ESP_LOGI(TAG, "OTA version compare: current=%d.%d.%d.%d target=%d.%d.%d.%d cmp=%d",
+                     cur[0], cur[1], cur[2], cur[3],
+                     tgt[0], tgt[1], tgt[2], tgt[3], cmp);
+            if (cmp <= 0) {
+                return OTA_ERR_NOT_NEWER;
+            }
+        } else {
+            ESP_LOGW(TAG, "OTA version parse fallback: current_ok=%s target_ok=%s, allowing update",
+                     current_ok ? "true" : "false",
+                     target_ok ? "true" : "false");
         }
     }
 
