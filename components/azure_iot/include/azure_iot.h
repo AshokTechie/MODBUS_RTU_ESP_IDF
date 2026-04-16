@@ -18,6 +18,7 @@ void azure_iot_register_method_callback(azure_iot_method_cb_t cb);
 esp_err_t azure_iot_connect(void);
 esp_err_t azure_iot_disconnect(void);
 bool azure_iot_is_connected(void);
+esp_err_t azure_iot_wait_until_connected(uint32_t timeout_ms);
 esp_err_t azure_iot_request_twin(void);
 esp_err_t azure_iot_publish_telemetry(const char *payload_json);
 esp_err_t azure_iot_start_background_task(void);

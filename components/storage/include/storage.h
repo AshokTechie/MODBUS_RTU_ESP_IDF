@@ -6,6 +6,14 @@
 
 #define STORAGE_SPIFFS_MOUNT "/spiffs"
 #define STORAGE_SD_MOUNT     "/sdcard"
+#define STORAGE_MAX_PATH_LEN 96
+#define STORAGE_USAGE_LIMIT_PCT 90
+
+typedef struct {
+    char path[STORAGE_MAX_PATH_LEN];
+    size_t size_bytes;
+    long mtime;
+} storage_file_info_t;
 
 typedef struct {
     size_t total_bytes;
@@ -29,3 +37,8 @@ esp_err_t storage_remove(const char *path);
 bool storage_exists(const char *path);
 storage_spiffs_health_t storage_spiffs_health(void);
 storage_sd_health_t storage_sd_health(void);
+int storage_usage_percent(void);
+bool storage_can_write(void);
+esp_err_t storage_list_prefix(const char *mount, const char *prefix, storage_file_info_t *out_files,
+                              size_t max_files, size_t *out_count);
+esp_err_t storage_rotate_prefix(const char *mount, const char *prefix, size_t keep_count, size_t *removed_count);

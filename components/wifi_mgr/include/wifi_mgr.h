@@ -7,7 +7,7 @@
  * WiFi Manager
  *
  * Credential load order (first non-empty wins):
- *   1. NVS namespace "rdu_cfg", keys "wifi_ssid" / "wifi_pass"
+ *   1. NVS namespace "smartload_cfg", then legacy namespace, keys "wifi_ssid" / "wifi_pass"
  *   2. /wifi.json  {"ssid":"...","password":"..."}
  *   3. DEFAULT_WIFI_SSID / DEFAULT_WIFI_PASS  (build-time fallback)
  *

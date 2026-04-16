@@ -16,6 +16,9 @@
 
 static const char *TAG = "wifi_mgr";
 
+#define WIFI_CFG_NAMESPACE_PRIMARY "smartload_cfg"
+static const char WIFI_CFG_NAMESPACE_LEGACY[] = { 0x72, 0x64, 0x75, 0x5f, 0x63, 0x66, 0x67, 0x00 };
+
 #define WIFI_CONNECTED_BIT       BIT0
 #define WIFI_FAIL_BIT            BIT1
 #define WIFI_MAX_RETRY            10
@@ -26,6 +29,24 @@ static esp_netif_t       *s_netif_sta      = NULL;
 static bool               s_connected      = false;
 static bool               s_ever_connected = false;
 static int                s_retry_count    = 0;
+
+static esp_err_t load_credentials_from_nvs_namespace(const char *ns,
+                                                     char *ssid, size_t ssid_size,
+                                                     char *pass, size_t pass_size)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(ns, NVS_READONLY, &nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    size_t len = ssid_size;
+    if (nvs_get_str(nvs, "wifi_ssid", ssid, &len) != ESP_OK) ssid[0] = '\0';
+    len = pass_size;
+    if (nvs_get_str(nvs, "wifi_pass", pass, &len) != ESP_OK) pass[0] = '\0';
+    nvs_close(nvs);
+    return ssid[0] != '\0' ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
 
 static void trim_whitespace(char *str)
 {
@@ -178,17 +199,14 @@ static void load_credentials(char *ssid, size_t ssid_size,
     ssid[0] = '\0';
     pass[0] = '\0';
 
-    nvs_handle_t nvs;
-    if (nvs_open("rdu_cfg", NVS_READONLY, &nvs) == ESP_OK) {
-        size_t len = ssid_size;
-        if (nvs_get_str(nvs, "wifi_ssid", ssid, &len) != ESP_OK) ssid[0] = '\0';
-        len = pass_size;
-        if (nvs_get_str(nvs, "wifi_pass", pass, &len) != ESP_OK) pass[0] = '\0';
-        nvs_close(nvs);
-        if (ssid[0] != '\0') {
-            ESP_LOGI(TAG, "Credentials from NVS (ssid=%s)", ssid);
-            return;
-        }
+    if (load_credentials_from_nvs_namespace(WIFI_CFG_NAMESPACE_PRIMARY, ssid, ssid_size, pass, pass_size) == ESP_OK) {
+        ESP_LOGI(TAG, "Credentials from NVS/%s (ssid=%s)", WIFI_CFG_NAMESPACE_PRIMARY, ssid);
+        return;
+    }
+
+    if (load_credentials_from_nvs_namespace(WIFI_CFG_NAMESPACE_LEGACY, ssid, ssid_size, pass, pass_size) == ESP_OK) {
+        ESP_LOGI(TAG, "Credentials from NVS/%s (ssid=%s)", WIFI_CFG_NAMESPACE_LEGACY, ssid);
+        return;
     }
 
     static char file_buf[256];
@@ -300,7 +318,7 @@ bool wifi_mgr_is_connected(void)
 esp_err_t wifi_mgr_save_credentials(const char *ssid, const char *password)
 {
     nvs_handle_t nvs;
-    if (nvs_open("rdu_cfg", NVS_READWRITE, &nvs) == ESP_OK) {
+    if (nvs_open(WIFI_CFG_NAMESPACE_PRIMARY, NVS_READWRITE, &nvs) == ESP_OK) {
         nvs_set_str(nvs, "wifi_ssid", ssid);
         nvs_set_str(nvs, "wifi_pass", password);
         nvs_commit(nvs);

@@ -30,6 +30,8 @@ typedef struct {
 esp_err_t mqtt_mgr_init(const mqtt_mgr_config_t *cfg, mqtt_mgr_event_cb_t callback, void *user_ctx);
 esp_err_t mqtt_mgr_connect(void);
 esp_err_t mqtt_mgr_disconnect(void);
+esp_err_t mqtt_mgr_wait_until_connected(uint32_t timeout_ms);
+esp_err_t mqtt_mgr_destroy(void);
 bool mqtt_mgr_is_connected(void);
 int mqtt_mgr_publish(const char *topic, const char *payload, int qos, int retain);
 esp_err_t mqtt_mgr_subscribe(const char *topic, int qos);

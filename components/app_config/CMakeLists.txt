@@ -1,5 +1,5 @@
 idf_component_register(
     SRCS "app_config.c"
     INCLUDE_DIRS "include"
-    REQUIRES nvs_flash json storage
+    REQUIRES nvs_flash json storage storage_manager
 )

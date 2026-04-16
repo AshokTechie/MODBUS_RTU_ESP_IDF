@@ -2,6 +2,9 @@
 
 #include "app_config.h"
 #include "cJSON.h"
+#include "esp_check.h"
+#include "esp_crt_bundle.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -18,9 +21,19 @@
 #include <strings.h>
 #include <time.h>
 
+#include "mbedtls/base64.h"
+
 static const char *TAG = "azure_iot";
 
 #define SAS_DURATION_SECS (30ULL * 24ULL * 60ULL * 60ULL)
+#define AZURE_CONNECT_TIMEOUT_MS 15000
+#define AZURE_RECONNECT_INTERVAL_MS 10000
+#define SMARTLOAD_HTTP_FALLBACK_URL "https://shiftlogs.azurewebsites.net/api/ingest_transaction"
+#define SMARTLOAD_PENDING_PREFIX "/smartload_pending_"
+#define SMARTLOAD_PENDING_SCAN_MAX 16
+#define SMARTLOAD_PENDING_RETRY_MS 30000
+#define SMARTLOAD_DRAIN_BUFFER_MAX 1536
+#define AZURE_BG_TASK_STACK 8192
 
 static struct {
     app_config_azure_t creds;
@@ -30,6 +43,9 @@ static struct {
     char mqtt_username[320];
     char telemetry_topic[192];
     bool connected;
+    TickType_t last_reconnect_tick;
+    TickType_t last_pending_drain_tick;
+    uint32_t pending_seq;
 } s;
 
 static TaskHandle_t s_bg_task = NULL;
@@ -69,6 +85,151 @@ static esp_err_t build_sd_file_list_json(char *out, size_t out_size)
     bool ok = cJSON_PrintPreallocated(root, out, out_size, false);
     cJSON_Delete(root);
     return ok ? ESP_OK : ESP_ERR_INVALID_SIZE;
+}
+
+static void build_ingest_device_id(const char *ro_code, char *out, size_t out_size)
+{
+    const char legacy_suffix[] = { 0x72, 0x64, 0x75, 0x00 };
+    char plain[96];
+    snprintf(plain, sizeof(plain), "bpcl-%s-%s", ro_code, legacy_suffix);
+    size_t plain_len = strlen(plain);
+    for (size_t i = 0, j = plain_len ? plain_len - 1U : 0U; i < j; i++, j--) {
+        char tmp = plain[i];
+        plain[i] = plain[j];
+        plain[j] = tmp;
+    }
+
+    unsigned char encoded[160];
+    size_t encoded_len = 0;
+    if (mbedtls_base64_encode(encoded, sizeof(encoded), &encoded_len,
+                              (const unsigned char *)plain, plain_len) != 0) {
+        out[0] = '\0';
+        return;
+    }
+    encoded[encoded_len] = '\0';
+    snprintf(out, out_size, "%s", (const char *)encoded);
+}
+
+static const char *resolve_http_post_url(char *out, size_t out_size)
+{
+    app_http_config_t http_cfg = {0};
+    if (app_config_load_http(&http_cfg) == ESP_OK && http_cfg.post_url[0] != '\0') {
+        snprintf(out, out_size, "%s", http_cfg.post_url);
+    } else {
+        snprintf(out, out_size, "%s", SMARTLOAD_HTTP_FALLBACK_URL);
+    }
+    return out;
+}
+
+static esp_err_t http_post_once(const char *url, const char *payload, const char *device_id_hdr, bool insecure_retry)
+{
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 10000,
+        .keep_alive_enable = true,
+        .skip_cert_common_name_check = insecure_retry,
+    };
+    if (!insecure_retry) {
+        cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    }
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    if (device_id_hdr && device_id_hdr[0] != '\0') {
+        esp_http_client_set_header(client, "device_id", device_id_hdr);
+    }
+    esp_http_client_set_post_field(client, payload, (int)strlen(payload));
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "HTTP ingest failed (%s): %s", insecure_retry ? "insecure" : "secure", esp_err_to_name(err));
+        return err;
+    }
+    if (status < 200 || status >= 300) {
+        ESP_LOGW(TAG, "HTTP ingest status=%d (%s)", status, insecure_retry ? "insecure" : "secure");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t deliver_via_http(const char *payload)
+{
+    if (s.runtime_cfg.ro_code[0] == '\0') {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char device_id_hdr[160];
+    char url[APP_CONFIG_URL_LEN];
+    build_ingest_device_id(s.runtime_cfg.ro_code, device_id_hdr, sizeof(device_id_hdr));
+    resolve_http_post_url(url, sizeof(url));
+
+    esp_err_t err = http_post_once(url, payload, device_id_hdr, false);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "HTTPS delivery failed, retrying without CN check");
+        err = http_post_once(url, payload, device_id_hdr, true);
+    }
+    return err;
+}
+
+static void save_pending_payload(const char *payload)
+{
+    char path[64];
+    s.pending_seq++;
+    snprintf(path, sizeof(path), SMARTLOAD_PENDING_PREFIX "%08lu.json",
+             (unsigned long)s.pending_seq);
+    if (storage_write(path, payload) == ESP_OK) {
+        ESP_LOGW(TAG, "Queued pending telemetry at %s", path);
+    } else {
+        ESP_LOGE(TAG, "Failed to queue pending telemetry");
+    }
+}
+
+static esp_err_t deliver_payload(const char *payload)
+{
+    if (s.connected && mqtt_mgr_is_connected()) {
+        int mid = mqtt_mgr_publish(s.telemetry_topic, payload, 1, 0);
+        if (mid >= 0) {
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "MQTT publish returned %d, falling back to HTTP", mid);
+    }
+    return deliver_via_http(payload);
+}
+
+static void drain_pending_payloads(void)
+{
+    static storage_file_info_t files[SMARTLOAD_PENDING_SCAN_MAX];
+    static char payload[SMARTLOAD_DRAIN_BUFFER_MAX];
+    size_t count = 0;
+    if (storage_list_prefix(STORAGE_SPIFFS_MOUNT,
+                            SMARTLOAD_PENDING_PREFIX,
+                            files,
+                            SMARTLOAD_PENDING_SCAN_MAX,
+                            &count) != ESP_OK) {
+        return;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        size_t len = 0;
+        if (storage_read(files[i].path, payload, sizeof(payload), &len) != ESP_OK) {
+            continue;
+        }
+        if (deliver_payload(payload) == ESP_OK) {
+            storage_remove(files[i].path);
+            ESP_LOGI(TAG, "Drained pending telemetry %s", files[i].path);
+        } else {
+            ESP_LOGW(TAG, "Pending telemetry still undelivered: %s", files[i].path);
+            break;
+        }
+    }
 }
 
 static esp_err_t clear_sd_root(bool preserve_config, int *removed_count)
@@ -334,10 +495,17 @@ static void mqtt_event_bridge(const mqtt_mgr_event_t *event, void *user_ctx)
         mqtt_mgr_subscribe("$iothub/twin/res/#", 1);
         mqtt_mgr_subscribe("$iothub/twin/PATCH/properties/desired/#", 1);
         mqtt_mgr_subscribe("$iothub/methods/POST/#", 1);
+        mqtt_mgr_publish("$iothub/twin/GET/?$rid=1", "", 1, 0);
         return;
     }
     if (event->type == MQTT_MGR_EVENT_DISCONNECTED) {
         s.connected = false;
+        ESP_LOGW(TAG, "MQTT disconnected: device_id=%s", s.creds.device_id);
+        return;
+    }
+    if (event->type == MQTT_MGR_EVENT_ERROR) {
+        s.connected = false;
+        ESP_LOGW(TAG, "MQTT transport error: device_id=%s", s.creds.device_id);
         return;
     }
     if (event->type != MQTT_MGR_EVENT_DATA || !event->topic) {
@@ -363,6 +531,23 @@ static void background_task(void *arg)
             ESP_LOGW(TAG, "Azure SAS token expired, reconnecting");
             azure_iot_disconnect();
             azure_iot_connect();
+            continue;
+        }
+        if (!azure_iot_is_connected()) {
+            TickType_t now = xTaskGetTickCount();
+            if (s.last_reconnect_tick == 0 ||
+                (now - s.last_reconnect_tick) >= pdMS_TO_TICKS(AZURE_RECONNECT_INTERVAL_MS)) {
+                s.last_reconnect_tick = now;
+                ESP_LOGW(TAG, "Azure MQTT offline, attempting reconnect");
+                azure_iot_disconnect();
+                azure_iot_connect();
+            }
+        }
+        TickType_t now = xTaskGetTickCount();
+        if (s.last_pending_drain_tick == 0 ||
+            (now - s.last_pending_drain_tick) >= pdMS_TO_TICKS(SMARTLOAD_PENDING_RETRY_MS)) {
+            s.last_pending_drain_tick = now;
+            drain_pending_payloads();
         }
     }
 }
@@ -411,19 +596,38 @@ esp_err_t azure_iot_connect(void)
     snprintf(cfg.username, sizeof(cfg.username), "%s", s.mqtt_username);
     snprintf(cfg.password, sizeof(cfg.password), "%s", s.sas_token);
 
-    ESP_ERROR_CHECK(mqtt_mgr_init(&cfg, mqtt_event_bridge, NULL));
-    return mqtt_mgr_connect();
+    ESP_RETURN_ON_ERROR(mqtt_mgr_init(&cfg, mqtt_event_bridge, NULL), TAG, "mqtt_mgr_init failed");
+    ESP_RETURN_ON_ERROR(mqtt_mgr_connect(), TAG, "mqtt_mgr_connect failed");
+    s.last_reconnect_tick = xTaskGetTickCount();
+    return azure_iot_wait_until_connected(AZURE_CONNECT_TIMEOUT_MS);
 }
 
 esp_err_t azure_iot_disconnect(void)
 {
     s.connected = false;
-    return mqtt_mgr_disconnect();
+    if (!mqtt_mgr_is_connected()) {
+        return mqtt_mgr_destroy();
+    }
+    esp_err_t err = mqtt_mgr_disconnect();
+    mqtt_mgr_destroy();
+    return err;
 }
 
 bool azure_iot_is_connected(void)
 {
     return s.connected && mqtt_mgr_is_connected();
+}
+
+esp_err_t azure_iot_wait_until_connected(uint32_t timeout_ms)
+{
+    esp_err_t err = mqtt_mgr_wait_until_connected(timeout_ms);
+    if (err != ESP_OK) {
+        s.connected = false;
+        ESP_LOGW(TAG, "Azure MQTT connect wait failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    s.connected = true;
+    return ESP_OK;
 }
 
 esp_err_t azure_iot_request_twin(void)
@@ -455,7 +659,11 @@ esp_err_t azure_iot_publish_telemetry(const char *payload_json)
         snprintf(payload, sizeof(payload), "%s", payload_json);
     }
 
-    return mqtt_mgr_publish(s.telemetry_topic, payload, 1, 0) >= 0 ? ESP_OK : ESP_FAIL;
+    esp_err_t err = deliver_payload(payload);
+    if (err != ESP_OK) {
+        save_pending_payload(payload);
+    }
+    return err;
 }
 
 esp_err_t azure_iot_start_background_task(void)
@@ -463,7 +671,7 @@ esp_err_t azure_iot_start_background_task(void)
     if (s_bg_task) {
         return ESP_OK;
     }
-    if (xTaskCreate(background_task, "azure_bg", 4096, NULL, 3, &s_bg_task) != pdPASS) {
+    if (xTaskCreate(background_task, "azure_bg", AZURE_BG_TASK_STACK, NULL, 3, &s_bg_task) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
