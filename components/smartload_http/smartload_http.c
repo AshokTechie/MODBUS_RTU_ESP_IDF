@@ -14,6 +14,8 @@
 #include "storage_manager.h"
 #include "wifi_mgr.h"
 
+#include "mbedtls/base64.h"
+
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
@@ -25,6 +27,7 @@ static const char *TAG = "smartload_http";
 #define SMARTLOAD_HTTP_NS "smartload"
 #define SMARTLOAD_HTTP_KEY_CONN "az_conn"
 #define SMARTLOAD_HTTP_KEY_DEVICE_ID "http_did"
+#define SMARTLOAD_HTTP_POST_DEVICE_ID "bpcl-788888-DU-1"
 
 typedef struct {
     char *buf;
@@ -140,8 +143,10 @@ static esp_err_t smartload_http_perform_json_request(esp_http_client_method_t me
         .url = url,
         .method = method,
         .timeout_ms = 10000,
+        .max_authorization_retries = -1,
         .event_handler = smartload_http_event_handler,
         .user_data = &resp,
+        .disable_auto_redirect = true,
     };
     if (strncmp(url, "https://", 8) == 0) {
         cfg.crt_bundle_attach = esp_crt_bundle_attach;
@@ -152,16 +157,51 @@ static esp_err_t smartload_http_perform_json_request(esp_http_client_method_t me
         return ESP_ERR_NO_MEM;
     }
 
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_header(client, "Accept", "application/json");
-    if (device_id && device_id[0] != '\0') {
+    if (method == HTTP_METHOD_POST && !payload) {
+        esp_http_client_cleanup(client);
+        ESP_LOGW(TAG, "HTTP POST payload is empty");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (method == HTTP_METHOD_POST && payload) {
+        if (!device_id || device_id[0] == '\0') {
+            esp_http_client_cleanup(client);
+            ESP_LOGW(TAG, "HTTP POST device_id is empty");
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        esp_err_t header_err = esp_http_client_delete_header(client, "User-Agent");
+        if (header_err != ESP_OK) {
+            esp_http_client_cleanup(client);
+            ESP_LOGW(TAG, "HTTP POST failed to remove default User-Agent: %s", esp_err_to_name(header_err));
+            return header_err;
+        }
+
+        /* Match curl contract exactly for POST: only Content-Type and device_id. */
+        header_err = esp_http_client_set_header(client, "Content-Type", "application/json");
+        if (header_err != ESP_OK) {
+            esp_http_client_cleanup(client);
+            ESP_LOGW(TAG, "HTTP POST failed to set Content-Type: %s", esp_err_to_name(header_err));
+            return header_err;
+        }
+
+        header_err = esp_http_client_set_header(client, "device_id", device_id);
+        if (header_err != ESP_OK) {
+            esp_http_client_cleanup(client);
+            ESP_LOGW(TAG, "HTTP POST failed to set device_id: %s", esp_err_to_name(header_err));
+            return header_err;
+        }
+        ESP_LOGI(TAG, "HTTP POST headers Content-Type=application/json device_id=%s", device_id);
+
+        header_err = esp_http_client_set_post_field(client, payload, (int)strlen(payload));
+        if (header_err != ESP_OK) {
+            esp_http_client_cleanup(client);
+            ESP_LOGW(TAG, "HTTP POST failed to attach payload: %s", esp_err_to_name(header_err));
+            return header_err;
+        }
+    } else if (device_id && device_id[0] != '\0') {
         esp_http_client_set_header(client, "device_id", device_id);
         ESP_LOGI(TAG, "HTTP header device_id=%s", device_id);
-    } else {
-        ESP_LOGW(TAG, "HTTP header device_id is empty (will likely fail auth)");
-    }
-    if (payload) {
-        esp_http_client_set_post_field(client, payload, (int)strlen(payload));
     }
 
     esp_err_t err = esp_http_client_perform(client);
@@ -211,6 +251,10 @@ static esp_err_t smartload_http_request_with_retry(esp_http_client_method_t meth
                  url);
         esp_err_t err = smartload_http_perform_json_request(method, url, payload, device_id,
                                                             response_buf, response_buf_size, out_status);
+        if (method == HTTP_METHOD_POST) {
+            ESP_LOGI(TAG, "TEMP POST verify attempt=%d status=%d err=%s body=%s",
+                     attempt, *out_status, esp_err_to_name(err), response_buf);
+        }
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "HTTP %s success status=%d <- %s body=%s",
                      method == HTTP_METHOD_POST ? "POST" : "GET",
@@ -345,12 +389,25 @@ static esp_err_t smartload_http_parse_connection_payload(const char *body,
         conn = cJSON_GetObjectItem(root, "connection_string");
     }
 
+    char top_level_device_id[APP_CONFIG_STR_LEN] = {0};
+    if (!smartload_http_copy_json_string(root, "deviceID", NULL,
+                                         top_level_device_id, sizeof(top_level_device_id)) &&
+        !smartload_http_copy_json_string(root, "deviceId", NULL,
+                                         top_level_device_id, sizeof(top_level_device_id))) {
+        (void)smartload_http_copy_json_string(root, "device_id", NULL,
+                                              top_level_device_id, sizeof(top_level_device_id));
+    }
+
     esp_err_t err = ESP_ERR_NOT_FOUND;
     if (cJSON_IsString(conn) && conn->valuestring[0] != '\0') {
         snprintf(connection_string, connection_string_size, "%s", conn->valuestring);
         err = app_config_parse_connection_string(conn->valuestring, out_cfg);
         if (err == ESP_OK && resolved_device_id && resolved_device_id_size > 0) {
-            snprintf(resolved_device_id, resolved_device_id_size, "%s", out_cfg->device_id);
+            if (out_cfg->device_id[0] != '\0') {
+                snprintf(resolved_device_id, resolved_device_id_size, "%s", out_cfg->device_id);
+            } else if (top_level_device_id[0] != '\0') {
+                snprintf(resolved_device_id, resolved_device_id_size, "%s", top_level_device_id);
+            }
         }
     } else {
         smartload_http_copy_json_string(root, "hostname", "HostName", out_cfg->hostname, sizeof(out_cfg->hostname));
@@ -358,8 +415,12 @@ static esp_err_t smartload_http_parse_connection_payload(const char *body,
         if (out_cfg->device_id[0] == '\0') {
             smartload_http_copy_json_string(root, "deviceId", NULL, out_cfg->device_id, sizeof(out_cfg->device_id));
         }
-        if (resolved_device_id && resolved_device_id_size > 0 && out_cfg->device_id[0] != '\0') {
-            snprintf(resolved_device_id, resolved_device_id_size, "%s", out_cfg->device_id);
+        if (resolved_device_id && resolved_device_id_size > 0) {
+            if (top_level_device_id[0] != '\0') {
+                snprintf(resolved_device_id, resolved_device_id_size, "%s", top_level_device_id);
+            } else if (out_cfg->device_id[0] != '\0') {
+                snprintf(resolved_device_id, resolved_device_id_size, "%s", out_cfg->device_id);
+            }
         }
         smartload_http_copy_json_string(root, "shared_access_key", "SharedAccessKey",
                                   out_cfg->shared_access_key, sizeof(out_cfg->shared_access_key));
@@ -423,7 +484,9 @@ static void smartload_http_process_connection_pull(const app_http_config_t *cfg)
                                             sizeof(resolved_device_id));
     if (resolved_device_id[0] != '\0') {
         smartload_http_store_device_id(resolved_device_id);
-        ESP_LOGI(TAG, "HTTP extracted backend device_id=%s", resolved_device_id);
+        ESP_LOGI(TAG, "HTTP identities resolved: azure_device_id=%s http_device_id=%s",
+                 azure_cfg.device_id[0] ? azure_cfg.device_id : "<unset>",
+                 resolved_device_id);
     }
     if (err != ESP_OK || !app_config_validate_azure(&azure_cfg)) {
         if (resolved_device_id[0] != '\0') {
@@ -446,7 +509,9 @@ static void smartload_http_process_connection_pull(const app_http_config_t *cfg)
         return;
     }
 
-    ESP_LOGI(TAG, "Stored Azure connection for device=%s", azure_cfg.device_id);
+    ESP_LOGI(TAG, "Stored Azure connection: azure_device_id=%s http_device_id=%s",
+             azure_cfg.device_id[0] ? azure_cfg.device_id : "<unset>",
+             s_device_id[0] ? s_device_id : "<unset>");
     if (s_callbacks.on_connection_string) {
         s_callbacks.on_connection_string(&azure_cfg);
     }
@@ -482,22 +547,46 @@ static void smartload_http_process_queue_item(const app_http_config_t *cfg, cons
         return;
     }
 
-    if (s_device_id[0] == '\0') {
+    char response[512];
+    int status = 0;
+    const char *raw_post_device_id = SMARTLOAD_HTTP_POST_DEVICE_ID;
+    char reversed_post_device_id[APP_CONFIG_STR_LEN] = {0};
+    char post_device_id_b64[((APP_CONFIG_STR_LEN + 2) / 3) * 4 + 1] = {0};
+    size_t raw_post_device_id_len = strlen(raw_post_device_id);
+    if (raw_post_device_id_len == 0 || raw_post_device_id_len >= sizeof(reversed_post_device_id)) {
         char saved_path[64];
         storage_manager_store_http_failure(item->payload, saved_path, sizeof(saved_path));
-        ESP_LOGW(TAG, "HTTP POST skipped: backend device_id not resolved (queued %s)", saved_path);
+        ESP_LOGW(TAG, "HTTP POST invalid device_id length=%u, queued %s",
+                 (unsigned)raw_post_device_id_len, saved_path);
         return;
     }
 
-    char response[512];
-    int status = 0;
+    for (size_t i = 0; i < raw_post_device_id_len; ++i) {
+        reversed_post_device_id[i] = raw_post_device_id[raw_post_device_id_len - 1 - i];
+    }
+    reversed_post_device_id[raw_post_device_id_len] = '\0';
+
+    size_t post_device_id_b64_len = 0;
+    int b64_err = mbedtls_base64_encode((unsigned char *)post_device_id_b64,
+                                        sizeof(post_device_id_b64),
+                                        &post_device_id_b64_len,
+                                        (const unsigned char *)reversed_post_device_id,
+                                        raw_post_device_id_len);
+    if (b64_err != 0 || post_device_id_b64_len == 0 || post_device_id_b64_len >= sizeof(post_device_id_b64)) {
+        char saved_path[64];
+        storage_manager_store_http_failure(item->payload, saved_path, sizeof(saved_path));
+        ESP_LOGW(TAG, "HTTP POST failed to base64 encode device_id (err=%d), queued %s", b64_err, saved_path);
+        return;
+    }
+    post_device_id_b64[post_device_id_b64_len] = '\0';
+
     ESP_LOGI(TAG, "HTTP POST payload => %s", item->payload);
-    ESP_LOGI(TAG, "HTTP POST using device_id=%s", s_device_id);
+    ESP_LOGI(TAG, "HTTP POST using reversed+base64 device_id=%s", post_device_id_b64);
     esp_err_t err = smartload_http_request_with_retry(HTTP_METHOD_POST,
                                                 cfg->post_url,
                                                 item->payload,
                                                 cfg,
-                                                s_device_id,
+                                                post_device_id_b64,
                                                 response,
                                                 sizeof(response),
                                                 &status);

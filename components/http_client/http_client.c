@@ -105,7 +105,7 @@ static esp_err_t http_perform_json_request(esp_http_client_method_t method,
         .timeout_ms = 10000,
         .event_handler = http_event_handler,
         .user_data = &resp,
-        .disable_auto_redirect = false,
+        .disable_auto_redirect = true,
     };
     if (strncmp(url, "https://", 8) == 0) {
         cfg.crt_bundle_attach = esp_crt_bundle_attach;
