@@ -30,6 +30,14 @@ esp_err_t storage_manager_write_text(const char *path, const char *data)
     }
 
     if (!storage_can_write()) {
+        size_t removed = 0;
+        (void)storage_manager_rotate_logs(STORAGE_MANAGER_HTTP_PREFIX, STORAGE_MANAGER_HTTP_KEEP_COUNT, &removed);
+        (void)storage_manager_rotate_logs(STORAGE_MANAGER_LOG_PREFIX, STORAGE_MANAGER_LOG_KEEP_COUNT, &removed);
+
+        if (storage_can_write()) {
+            return storage_write(path, data);
+        }
+
         int usage = storage_usage_percent();
         ESP_LOGW(TAG, "Skipping write for %s: storage usage=%d%%", path ? path : "<null>", usage);
         return ESP_ERR_NO_MEM;

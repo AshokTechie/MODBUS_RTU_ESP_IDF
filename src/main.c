@@ -8,6 +8,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "modbus_rtu.h"
+#include "nvs_manager.h"
 #include "nvs_flash.h"
 #include "smartload_http.h"
 #include "smartload_protocol.h"
@@ -36,6 +37,26 @@ static esp_err_t build_status_json(char *out, size_t out_size);
 #define SMARTLOAD_HTTP_DEFAULT_POST_URL "https://shiftlogs.azurewebsites.net/api/atg_post"
 #define SMARTLOAD_HTTP_DEFAULT_CONN_URL_FMT "https://enterpriseiotro.azurewebsites.net/api/getDeviceDetails?chipID=%llu"
 #define SMARTLOAD_HTTP_PROVISION_CHIP_ID 9960508ULL
+
+#define APP_CFG_NVS_NAMESPACE "smartload"
+#define WIFI_CFG_NVS_NAMESPACE "smartload_cfg"
+#define WIFI_CFG_NVS_LEGACY_NAMESPACE "rdu_cfg"
+
+static void init_nvs_namespaces(void)
+{
+    static const char *k_namespaces[] = {
+        APP_CFG_NVS_NAMESPACE,
+        WIFI_CFG_NVS_NAMESPACE,
+        WIFI_CFG_NVS_LEGACY_NAMESPACE,
+    };
+
+    for (size_t i = 0; i < (sizeof(k_namespaces) / sizeof(k_namespaces[0])); i++) {
+        esp_err_t err = nvs_manager_init_namespace(k_namespaces[i]);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to init NVS namespace %s: %s", k_namespaces[i], esp_err_to_name(err));
+        }
+    }
+}
 
 static void apply_http_defaults(void)
 {
@@ -359,6 +380,8 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }
+
+    init_nvs_namespaces();
 
     ESP_ERROR_CHECK(board_init());
     ESP_ERROR_CHECK(storage_init());

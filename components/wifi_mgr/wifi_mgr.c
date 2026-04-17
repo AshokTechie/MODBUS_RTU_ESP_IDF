@@ -1,4 +1,5 @@
 #include "wifi_mgr.h"
+#include "nvs_manager.h"
 #include "storage.h"
 
 #include "cJSON.h"
@@ -8,7 +9,6 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
-#include "nvs.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -34,17 +34,12 @@ static esp_err_t load_credentials_from_nvs_namespace(const char *ns,
                                                      char *ssid, size_t ssid_size,
                                                      char *pass, size_t pass_size)
 {
-    nvs_handle_t nvs;
-    esp_err_t err = nvs_open(ns, NVS_READONLY, &nvs);
-    if (err != ESP_OK) {
-        return err;
+    if (nvs_manager_get_str(ns, "wifi_ssid", ssid, ssid_size) != ESP_OK) {
+        ssid[0] = '\0';
     }
-
-    size_t len = ssid_size;
-    if (nvs_get_str(nvs, "wifi_ssid", ssid, &len) != ESP_OK) ssid[0] = '\0';
-    len = pass_size;
-    if (nvs_get_str(nvs, "wifi_pass", pass, &len) != ESP_OK) pass[0] = '\0';
-    nvs_close(nvs);
+    if (nvs_manager_get_str(ns, "wifi_pass", pass, pass_size) != ESP_OK) {
+        pass[0] = '\0';
+    }
     return ssid[0] != '\0' ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
@@ -317,18 +312,19 @@ bool wifi_mgr_is_connected(void)
 
 esp_err_t wifi_mgr_save_credentials(const char *ssid, const char *password)
 {
-    nvs_handle_t nvs;
-    if (nvs_open(WIFI_CFG_NAMESPACE_PRIMARY, NVS_READWRITE, &nvs) == ESP_OK) {
-        nvs_set_str(nvs, "wifi_ssid", ssid);
-        nvs_set_str(nvs, "wifi_pass", password);
-        nvs_commit(nvs);
-        nvs_close(nvs);
+    esp_err_t err = nvs_manager_set_str(WIFI_CFG_NAMESPACE_PRIMARY, "wifi_ssid", ssid);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to store wifi_ssid: %s", esp_err_to_name(err));
+    }
+    err = nvs_manager_set_str(WIFI_CFG_NAMESPACE_PRIMARY, "wifi_pass", password);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to store wifi_pass: %s", esp_err_to_name(err));
     }
 
     static char json_buf[192];
     snprintf(json_buf, sizeof(json_buf),
              "{\"ssid\":\"%s\",\"password\":\"%s\"}", ssid, password);
-    esp_err_t err = storage_write("/wifi.json", json_buf);
+    err = storage_write("/wifi.json", json_buf);
     ESP_LOGI(TAG, "Credentials saved (ssid=%s)", ssid);
     return err;
 }

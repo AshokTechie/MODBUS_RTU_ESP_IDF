@@ -3,6 +3,7 @@
 #include "cJSON.h"
 #include "esp_log.h"
 #include "nvs.h"
+#include "nvs_manager.h"
 #include "storage.h"
 #include "storage_manager.h"
 
@@ -13,8 +14,6 @@
 static const char *TAG = "app_config";
 
 #define APP_CONFIG_NVS_NAMESPACE "smartload"
-#define APP_CONFIG_MAX_NVS_KEY_LEN 15
-#define APP_CONFIG_MAX_NVS_STR_LEN 384
 
 static esp_err_t parse_azure_json(const char *json, size_t json_len, app_config_azure_t *out_cfg);
 static esp_err_t scan_mount_for_azure(const char *mount, app_config_azure_t *out_cfg);
@@ -26,61 +25,14 @@ static esp_err_t scan_mount_for_azure(const char *mount, app_config_azure_t *out
 #define HTTP_CONFIG_FILE    "/http_config.json"
 #define SMARTLOAD_HTTP_CONFIG_FILE "/smartload_http.json"
 
-static bool app_config_valid_nvs_key(const char *key)
-{
-    return key && key[0] != '\0' && strlen(key) <= APP_CONFIG_MAX_NVS_KEY_LEN;
-}
-
-static esp_err_t app_config_nvs_set_str(nvs_handle_t nvs, const char *key, const char *value)
-{
-    if (!app_config_valid_nvs_key(key)) {
-        ESP_LOGE(TAG, "Invalid NVS key '%s'", key ? key : "<null>");
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (!value) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (strlen(value) >= APP_CONFIG_MAX_NVS_STR_LEN) {
-        ESP_LOGE(TAG, "NVS value too large for key '%s' (%u bytes)",
-                 key, (unsigned)strlen(value));
-        return ESP_ERR_INVALID_SIZE;
-    }
-    esp_err_t err = nvs_set_str(nvs, key, value);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "nvs_set_str(%s) failed: %s", key, esp_err_to_name(err));
-    }
-    return err;
-}
-
-static esp_err_t app_config_nvs_get_str(nvs_handle_t nvs, const char *key, char *out, size_t out_size)
-{
-    if (!app_config_valid_nvs_key(key) || !out || out_size == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    size_t len = out_size;
-    esp_err_t err = nvs_get_str(nvs, key, out, &len);
-    if (err != ESP_OK) {
-        out[0] = '\0';
-    }
-    return err;
-}
-
-static esp_err_t app_config_nvs_set_i32(nvs_handle_t nvs, const char *key, int32_t value)
-{
-    if (!app_config_valid_nvs_key(key)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    esp_err_t err = nvs_set_i32(nvs, key, value);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "nvs_set_i32(%s) failed: %s", key, esp_err_to_name(err));
-    }
-    return err;
-}
-
 static esp_err_t read_json_from_mount(const char *mount, const char *path, char *buf, size_t buf_size, size_t *out_len)
 {
     if (!mount || !path || !buf || buf_size < 2) {
         return ESP_ERR_INVALID_ARG;
+    }
+
+    if (strcmp(mount, STORAGE_SPIFFS_MOUNT) == 0) {
+        return storage_read_from_mount(STORAGE_SPIFFS_MOUNT, path, buf, buf_size, out_len);
     }
 
     char full_path[160];
@@ -223,6 +175,23 @@ static esp_err_t save_json_blob(const char *path, const char *json)
     return storage_manager_write_text(path, json);
 }
 
+static esp_err_t save_nvs_str_if_changed(const char *key, const char *value)
+{
+    if (!key || !value) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char existing[NVS_MANAGER_MAX_STR_LEN] = {0};
+    esp_err_t err = nvs_manager_get_str(APP_CONFIG_NVS_NAMESPACE, key, existing, sizeof(existing));
+    if (err == ESP_OK && strcmp(existing, value) == 0) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        return err;
+    }
+    return nvs_manager_set_str(APP_CONFIG_NVS_NAMESPACE, key, value);
+}
+
 static esp_err_t parse_http_json_blob(const char *json, size_t json_len, app_http_config_t *out_cfg)
 {
     cJSON *root = cJSON_ParseWithLength(json, json_len);
@@ -264,17 +233,19 @@ static void save_azure_to_nvs(const app_config_azure_t *cfg)
         return;
     }
 
-    nvs_handle_t nvs;
-    if (nvs_open(APP_CONFIG_NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
-        if (app_config_nvs_set_str(nvs, "az_host", cfg->hostname) == ESP_OK &&
-            app_config_nvs_set_str(nvs, "az_dev", cfg->device_id) == ESP_OK &&
-            app_config_nvs_set_str(nvs, "az_sak", cfg->shared_access_key) == ESP_OK) {
-            esp_err_t commit_err = nvs_commit(nvs);
-            if (commit_err != ESP_OK) {
-                ESP_LOGE(TAG, "nvs_commit(azure) failed: %s", esp_err_to_name(commit_err));
-            }
-        }
-        nvs_close(nvs);
+    esp_err_t err = save_nvs_str_if_changed("az_host", cfg->hostname);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to persist az_host: %s", esp_err_to_name(err));
+        return;
+    }
+    err = save_nvs_str_if_changed("az_dev", cfg->device_id);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to persist az_dev: %s", esp_err_to_name(err));
+        return;
+    }
+    err = save_nvs_str_if_changed("az_sak", cfg->shared_access_key);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to persist az_sak: %s", esp_err_to_name(err));
     }
 }
 
@@ -331,17 +302,13 @@ esp_err_t app_config_load_azure(app_config_azure_t *out_cfg)
         return ESP_OK;
     }
 
-    nvs_handle_t nvs;
-    if (nvs_open(APP_CONFIG_NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
-        app_config_nvs_get_str(nvs, "az_host", out_cfg->hostname, sizeof(out_cfg->hostname));
-        app_config_nvs_get_str(nvs, "az_dev", out_cfg->device_id, sizeof(out_cfg->device_id));
-        app_config_nvs_get_str(nvs, "az_sak", out_cfg->shared_access_key, sizeof(out_cfg->shared_access_key));
-        nvs_close(nvs);
-        if (out_cfg->hostname[0] != '\0' && out_cfg->device_id[0] != '\0') {
-            ESP_LOGI(TAG, "Azure config loaded from NVS (host=%s device=%s)",
-                     out_cfg->hostname, out_cfg->device_id);
-            return ESP_OK;
-        }
+    (void)nvs_manager_get_str(APP_CONFIG_NVS_NAMESPACE, "az_host", out_cfg->hostname, sizeof(out_cfg->hostname));
+    (void)nvs_manager_get_str(APP_CONFIG_NVS_NAMESPACE, "az_dev", out_cfg->device_id, sizeof(out_cfg->device_id));
+    (void)nvs_manager_get_str(APP_CONFIG_NVS_NAMESPACE, "az_sak", out_cfg->shared_access_key, sizeof(out_cfg->shared_access_key));
+    if (out_cfg->hostname[0] != '\0' && out_cfg->device_id[0] != '\0') {
+        ESP_LOGI(TAG, "Azure config loaded from NVS (host=%s device=%s)",
+                 out_cfg->hostname, out_cfg->device_id);
+        return ESP_OK;
     }
 
     ESP_LOGW(TAG, "Azure config not found in NVS, %s, %s, or %s",
@@ -355,17 +322,17 @@ esp_err_t app_config_save_azure(const app_config_azure_t *cfg)
         return ESP_ERR_INVALID_ARG;
     }
 
-    nvs_handle_t nvs;
-    if (nvs_open(APP_CONFIG_NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
-        if (app_config_nvs_set_str(nvs, "az_host", cfg->hostname) == ESP_OK &&
-            app_config_nvs_set_str(nvs, "az_dev", cfg->device_id) == ESP_OK &&
-            app_config_nvs_set_str(nvs, "az_sak", cfg->shared_access_key) == ESP_OK) {
-            esp_err_t commit_err = nvs_commit(nvs);
-            if (commit_err != ESP_OK) {
-                ESP_LOGE(TAG, "nvs_commit(app_config_save_azure) failed: %s", esp_err_to_name(commit_err));
-            }
-        }
-        nvs_close(nvs);
+    esp_err_t nvs_err = save_nvs_str_if_changed("az_host", cfg->hostname);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save az_host: %s", esp_err_to_name(nvs_err));
+    }
+    nvs_err = save_nvs_str_if_changed("az_dev", cfg->device_id);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save az_dev: %s", esp_err_to_name(nvs_err));
+    }
+    nvs_err = save_nvs_str_if_changed("az_sak", cfg->shared_access_key);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save az_sak: %s", esp_err_to_name(nvs_err));
     }
 
     char json[512];
@@ -395,6 +362,28 @@ static bool has_json_like_extension(const char *name)
 
 static esp_err_t scan_mount_for_azure(const char *mount, app_config_azure_t *out_cfg)
 {
+    if (strcmp(mount, STORAGE_SPIFFS_MOUNT) == 0) {
+        storage_file_info_t files[16];
+        size_t count = 0;
+        if (storage_list_prefix(STORAGE_SPIFFS_MOUNT, "/", files, sizeof(files) / sizeof(files[0]), &count) != ESP_OK) {
+            return ESP_ERR_NOT_FOUND;
+        }
+
+        for (size_t i = 0; i < count; i++) {
+            const char *name = files[i].path[0] == '/' ? files[i].path + 1 : files[i].path;
+            if (!has_json_like_extension(name)) {
+                continue;
+            }
+
+            esp_err_t err = load_azure_from_path(mount, files[i].path, out_cfg);
+            if (err == ESP_OK) {
+                return ESP_OK;
+            }
+        }
+
+        return ESP_ERR_NOT_FOUND;
+    }
+
     DIR *dir = opendir(mount);
     if (!dir) {
         return ESP_ERR_NOT_FOUND;
@@ -449,24 +438,22 @@ esp_err_t app_config_load_runtime(app_runtime_config_t *out_cfg)
     out_cfg->telemetry_interval_sec = 30;
     out_cfg->polling_interval_sec = 30;
 
-    nvs_handle_t nvs;
-    if (nvs_open(APP_CONFIG_NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
-        app_config_nvs_get_str(nvs, "ro_code", out_cfg->ro_code, sizeof(out_cfg->ro_code));
-        app_config_nvs_get_str(nvs, "dev_name", out_cfg->device_name, sizeof(out_cfg->device_name));
-        app_config_nvs_get_str(nvs, "dev_parm", out_cfg->device_params_json, sizeof(out_cfg->device_params_json));
-        int32_t interval = 30;
-        if (nvs_get_i32(nvs, "telemetry", &interval) == ESP_OK) {
-            out_cfg->telemetry_interval_sec = interval;
-        }
-        interval = 30;
-        if (nvs_get_i32(nvs, "poll_int", &interval) == ESP_OK) {
-            out_cfg->polling_interval_sec = interval;
-        }
-        nvs_close(nvs);
-        if (out_cfg->ro_code[0] != '\0' || out_cfg->device_name[0] != '\0' ||
-            out_cfg->device_params_json[0] != '\0') {
-            return ESP_OK;
-        }
+    (void)nvs_manager_get_str(APP_CONFIG_NVS_NAMESPACE, "ro_code", out_cfg->ro_code, sizeof(out_cfg->ro_code));
+    (void)nvs_manager_get_str(APP_CONFIG_NVS_NAMESPACE, "dev_name", out_cfg->device_name, sizeof(out_cfg->device_name));
+    (void)nvs_manager_get_str(APP_CONFIG_NVS_NAMESPACE, "dev_parm", out_cfg->device_params_json, sizeof(out_cfg->device_params_json));
+
+    int32_t interval = 30;
+    if (nvs_manager_get_i32(APP_CONFIG_NVS_NAMESPACE, "telemetry", &interval) == ESP_OK) {
+        out_cfg->telemetry_interval_sec = interval;
+    }
+    interval = 30;
+    if (nvs_manager_get_i32(APP_CONFIG_NVS_NAMESPACE, "poll_int", &interval) == ESP_OK) {
+        out_cfg->polling_interval_sec = interval;
+    }
+
+    if (out_cfg->ro_code[0] != '\0' || out_cfg->device_name[0] != '\0' ||
+        out_cfg->device_params_json[0] != '\0') {
+        return ESP_OK;
     }
 
     char file_buf[512] = {0};
@@ -504,19 +491,25 @@ esp_err_t app_config_save_runtime(const app_runtime_config_t *cfg)
         return ESP_ERR_INVALID_ARG;
     }
 
-    nvs_handle_t nvs;
-    if (nvs_open(APP_CONFIG_NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
-        if (app_config_nvs_set_str(nvs, "ro_code", cfg->ro_code) == ESP_OK &&
-            app_config_nvs_set_str(nvs, "dev_name", cfg->device_name) == ESP_OK &&
-            app_config_nvs_set_str(nvs, "dev_parm", cfg->device_params_json) == ESP_OK &&
-            app_config_nvs_set_i32(nvs, "telemetry", cfg->telemetry_interval_sec) == ESP_OK &&
-            app_config_nvs_set_i32(nvs, "poll_int", cfg->polling_interval_sec) == ESP_OK) {
-            esp_err_t commit_err = nvs_commit(nvs);
-            if (commit_err != ESP_OK) {
-                ESP_LOGE(TAG, "nvs_commit(runtime) failed: %s", esp_err_to_name(commit_err));
-            }
-        }
-        nvs_close(nvs);
+    esp_err_t nvs_err = nvs_manager_set_str(APP_CONFIG_NVS_NAMESPACE, "ro_code", cfg->ro_code);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save ro_code: %s", esp_err_to_name(nvs_err));
+    }
+    nvs_err = nvs_manager_set_str(APP_CONFIG_NVS_NAMESPACE, "dev_name", cfg->device_name);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save dev_name: %s", esp_err_to_name(nvs_err));
+    }
+    nvs_err = nvs_manager_set_str(APP_CONFIG_NVS_NAMESPACE, "dev_parm", cfg->device_params_json);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save dev_parm: %s", esp_err_to_name(nvs_err));
+    }
+    nvs_err = nvs_manager_set_i32(APP_CONFIG_NVS_NAMESPACE, "telemetry", cfg->telemetry_interval_sec);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save telemetry: %s", esp_err_to_name(nvs_err));
+    }
+    nvs_err = nvs_manager_set_i32(APP_CONFIG_NVS_NAMESPACE, "poll_int", cfg->polling_interval_sec);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save poll_int: %s", esp_err_to_name(nvs_err));
     }
 
     char json[512];
@@ -545,22 +538,18 @@ esp_err_t app_config_load_http(app_http_config_t *out_cfg)
     out_cfg->retry_max = 3;
     out_cfg->retry_backoff_ms = 2000;
 
-    nvs_handle_t nvs;
-    if (nvs_open(APP_CONFIG_NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
-        int32_t value = 0;
-        app_config_nvs_get_str(nvs, "h_post", out_cfg->post_url, sizeof(out_cfg->post_url));
-        app_config_nvs_get_str(nvs, "h_cfg", out_cfg->config_url, sizeof(out_cfg->config_url));
-        app_config_nvs_get_str(nvs, "h_conn", out_cfg->conn_url, sizeof(out_cfg->conn_url));
-        if (nvs_get_i32(nvs, "http_on", &value) == ESP_OK) out_cfg->enabled = value != 0;
-        if (nvs_get_i32(nvs, "h_post_i", &value) == ESP_OK) out_cfg->post_interval_sec = value;
-        if (nvs_get_i32(nvs, "h_cfg_i", &value) == ESP_OK) out_cfg->config_interval_sec = value;
-        if (nvs_get_i32(nvs, "h_conn_i", &value) == ESP_OK) out_cfg->conn_interval_sec = value;
-        if (nvs_get_i32(nvs, "h_retry", &value) == ESP_OK) out_cfg->retry_max = value;
-        if (nvs_get_i32(nvs, "h_backoff", &value) == ESP_OK) out_cfg->retry_backoff_ms = value;
-        nvs_close(nvs);
-        if (out_cfg->post_url[0] != '\0' || out_cfg->config_url[0] != '\0' || out_cfg->conn_url[0] != '\0') {
-            return ESP_OK;
-        }
+    int32_t value = 0;
+    (void)nvs_manager_get_str(APP_CONFIG_NVS_NAMESPACE, "h_post", out_cfg->post_url, sizeof(out_cfg->post_url));
+    (void)nvs_manager_get_str(APP_CONFIG_NVS_NAMESPACE, "h_cfg", out_cfg->config_url, sizeof(out_cfg->config_url));
+    (void)nvs_manager_get_str(APP_CONFIG_NVS_NAMESPACE, "h_conn", out_cfg->conn_url, sizeof(out_cfg->conn_url));
+    if (nvs_manager_get_i32(APP_CONFIG_NVS_NAMESPACE, "http_on", &value) == ESP_OK) out_cfg->enabled = value != 0;
+    if (nvs_manager_get_i32(APP_CONFIG_NVS_NAMESPACE, "h_post_i", &value) == ESP_OK) out_cfg->post_interval_sec = value;
+    if (nvs_manager_get_i32(APP_CONFIG_NVS_NAMESPACE, "h_cfg_i", &value) == ESP_OK) out_cfg->config_interval_sec = value;
+    if (nvs_manager_get_i32(APP_CONFIG_NVS_NAMESPACE, "h_conn_i", &value) == ESP_OK) out_cfg->conn_interval_sec = value;
+    if (nvs_manager_get_i32(APP_CONFIG_NVS_NAMESPACE, "h_retry", &value) == ESP_OK) out_cfg->retry_max = value;
+    if (nvs_manager_get_i32(APP_CONFIG_NVS_NAMESPACE, "h_backoff", &value) == ESP_OK) out_cfg->retry_backoff_ms = value;
+    if (out_cfg->post_url[0] != '\0' || out_cfg->config_url[0] != '\0' || out_cfg->conn_url[0] != '\0') {
+        return ESP_OK;
     }
 
     char file_buf[768] = {0};
@@ -581,23 +570,41 @@ esp_err_t app_config_save_http(const app_http_config_t *cfg)
         return ESP_ERR_INVALID_ARG;
     }
 
-    nvs_handle_t nvs;
-    if (nvs_open(APP_CONFIG_NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
-        if (app_config_nvs_set_str(nvs, "h_post", cfg->post_url) == ESP_OK &&
-            app_config_nvs_set_str(nvs, "h_cfg", cfg->config_url) == ESP_OK &&
-            app_config_nvs_set_str(nvs, "h_conn", cfg->conn_url) == ESP_OK &&
-            app_config_nvs_set_i32(nvs, "http_on", cfg->enabled ? 1 : 0) == ESP_OK &&
-            app_config_nvs_set_i32(nvs, "h_post_i", cfg->post_interval_sec) == ESP_OK &&
-            app_config_nvs_set_i32(nvs, "h_cfg_i", cfg->config_interval_sec) == ESP_OK &&
-            app_config_nvs_set_i32(nvs, "h_conn_i", cfg->conn_interval_sec) == ESP_OK &&
-            app_config_nvs_set_i32(nvs, "h_retry", cfg->retry_max) == ESP_OK &&
-            app_config_nvs_set_i32(nvs, "h_backoff", cfg->retry_backoff_ms) == ESP_OK) {
-            esp_err_t commit_err = nvs_commit(nvs);
-            if (commit_err != ESP_OK) {
-                ESP_LOGE(TAG, "nvs_commit(http) failed: %s", esp_err_to_name(commit_err));
-            }
-        }
-        nvs_close(nvs);
+    esp_err_t nvs_err = nvs_manager_set_str(APP_CONFIG_NVS_NAMESPACE, "h_post", cfg->post_url);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save h_post: %s", esp_err_to_name(nvs_err));
+    }
+    nvs_err = nvs_manager_set_str(APP_CONFIG_NVS_NAMESPACE, "h_cfg", cfg->config_url);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save h_cfg: %s", esp_err_to_name(nvs_err));
+    }
+    nvs_err = nvs_manager_set_str(APP_CONFIG_NVS_NAMESPACE, "h_conn", cfg->conn_url);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save h_conn: %s", esp_err_to_name(nvs_err));
+    }
+    nvs_err = nvs_manager_set_i32(APP_CONFIG_NVS_NAMESPACE, "http_on", cfg->enabled ? 1 : 0);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save http_on: %s", esp_err_to_name(nvs_err));
+    }
+    nvs_err = nvs_manager_set_i32(APP_CONFIG_NVS_NAMESPACE, "h_post_i", cfg->post_interval_sec);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save h_post_i: %s", esp_err_to_name(nvs_err));
+    }
+    nvs_err = nvs_manager_set_i32(APP_CONFIG_NVS_NAMESPACE, "h_cfg_i", cfg->config_interval_sec);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save h_cfg_i: %s", esp_err_to_name(nvs_err));
+    }
+    nvs_err = nvs_manager_set_i32(APP_CONFIG_NVS_NAMESPACE, "h_conn_i", cfg->conn_interval_sec);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save h_conn_i: %s", esp_err_to_name(nvs_err));
+    }
+    nvs_err = nvs_manager_set_i32(APP_CONFIG_NVS_NAMESPACE, "h_retry", cfg->retry_max);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save h_retry: %s", esp_err_to_name(nvs_err));
+    }
+    nvs_err = nvs_manager_set_i32(APP_CONFIG_NVS_NAMESPACE, "h_backoff", cfg->retry_backoff_ms);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save h_backoff: %s", esp_err_to_name(nvs_err));
     }
 
     char json[1024];

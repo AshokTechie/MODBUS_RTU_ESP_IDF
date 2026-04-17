@@ -15,6 +15,9 @@ static const char *TAG = "storage";
 static SemaphoreHandle_t s_lock = NULL;
 static bool s_sd_available = false;
 
+#define STORAGE_CLEANUP_KEEP_SOFT 8
+#define STORAGE_CLEANUP_KEEP_HARD 4
+
 static void build_full_path(char *out, size_t out_size, const char *mount, const char *path);
 
 static int storage_compare_mtime(const void *lhs, const void *rhs)
@@ -80,32 +83,52 @@ static size_t storage_collect_prefix_locked(const char *mount, const char *prefi
     return count;
 }
 
-static void storage_try_cleanup_locked(void)
+static size_t storage_cleanup_prefix_locked(const char *prefix, size_t keep_count)
 {
     storage_file_info_t files[16];
-    size_t removed = 0;
-    if (storage_usage_percent_locked() < STORAGE_USAGE_LIMIT_PCT) {
-        return;
+    size_t count = storage_collect_prefix_locked(STORAGE_SPIFFS_MOUNT,
+                                                 prefix,
+                                                 files,
+                                                 sizeof(files) / sizeof(files[0]));
+    if (count <= keep_count) {
+        return 0;
     }
 
-    size_t count = storage_collect_prefix_locked(STORAGE_SPIFFS_MOUNT, "/http_", files, 16);
-    if (count <= 8) {
-        count = storage_collect_prefix_locked(STORAGE_SPIFFS_MOUNT, "/log_", files, 16);
-    }
-    if (count > 8) {
-        qsort(files, count, sizeof(files[0]), storage_compare_mtime);
-        for (size_t i = 0; i < count - 8; i++) {
-            char full_path[STORAGE_MAX_PATH_LEN];
-            build_full_path(full_path, sizeof(full_path), STORAGE_SPIFFS_MOUNT, files[i].path);
-            if (remove(full_path) == 0) {
-                removed++;
-            }
+    size_t removed = 0;
+    qsort(files, count, sizeof(files[0]), storage_compare_mtime);
+    for (size_t i = 0; i < count - keep_count; i++) {
+        char full_path[STORAGE_MAX_PATH_LEN];
+        build_full_path(full_path, sizeof(full_path), STORAGE_SPIFFS_MOUNT, files[i].path);
+        if (remove(full_path) == 0) {
+            removed++;
         }
     }
 
+    return removed;
+}
+
+static void storage_try_cleanup_locked(void)
+{
+    int usage = storage_usage_percent_locked();
+    if (usage < STORAGE_WRITE_BLOCK_PCT) {
+        return;
+    }
+
+    size_t removed = 0;
+    removed += storage_cleanup_prefix_locked("/http_", STORAGE_CLEANUP_KEEP_SOFT);
+    removed += storage_cleanup_prefix_locked("/log_", STORAGE_CLEANUP_KEEP_SOFT);
+
+    usage = storage_usage_percent_locked();
+    if (usage >= STORAGE_USAGE_LIMIT_PCT) {
+        removed += storage_cleanup_prefix_locked("/http_", STORAGE_CLEANUP_KEEP_HARD);
+        removed += storage_cleanup_prefix_locked("/log_", STORAGE_CLEANUP_KEEP_HARD);
+        usage = storage_usage_percent_locked();
+    }
+
     if (removed > 0U) {
-        ESP_LOGW(TAG, "Storage cleanup removed %u files to stay below %u%% usage",
-                 (unsigned)removed, STORAGE_USAGE_LIMIT_PCT);
+        ESP_LOGW(TAG, "Storage cleanup removed %u files, usage now %d%%",
+                 (unsigned)removed,
+                 usage);
     }
 }
 
@@ -153,6 +176,33 @@ void storage_set_sd_available(bool available)
 bool storage_sd_is_available(void)
 {
     return s_sd_available;
+}
+
+esp_err_t storage_read_from_mount(const char *mount, const char *path, char *buf, size_t buf_size, size_t *out_len)
+{
+    if (!mount || !path || !buf || buf_size < 2) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+
+    char full_path[STORAGE_MAX_PATH_LEN];
+    build_full_path(full_path, sizeof(full_path), mount, path);
+    FILE *f = fopen(full_path, "r");
+    if (!f) {
+        xSemaphoreGive(s_lock);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    size_t read = fread(buf, 1, buf_size - 1, f);
+    fclose(f);
+    buf[read] = '\0';
+    if (out_len) {
+        *out_len = read;
+    }
+
+    xSemaphoreGive(s_lock);
+    return ESP_OK;
 }
 
 esp_err_t storage_read(const char *path, char *buf, size_t buf_size, size_t *out_len)
@@ -203,7 +253,7 @@ esp_err_t storage_write(const char *path, const char *data)
     build_full_path(full_path, sizeof(full_path), STORAGE_SPIFFS_MOUNT, path);
     storage_try_cleanup_locked();
     int usage_pct = storage_usage_percent_locked();
-    if (usage_pct >= STORAGE_USAGE_LIMIT_PCT) {
+    if (usage_pct >= STORAGE_WRITE_BLOCK_PCT) {
         ESP_LOGW(TAG, "Refusing SPIFFS write for %s: usage=%d%%", path, usage_pct);
         result = ESP_ERR_NO_MEM;
     } else {
@@ -283,7 +333,7 @@ int storage_usage_percent(void)
 bool storage_can_write(void)
 {
     int usage = storage_usage_percent();
-    return usage < 0 || usage < STORAGE_USAGE_LIMIT_PCT;
+    return usage < 0 || usage < STORAGE_WRITE_BLOCK_PCT;
 }
 
 esp_err_t storage_list_prefix(const char *mount, const char *prefix, storage_file_info_t *out_files,

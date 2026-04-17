@@ -46,7 +46,9 @@ static TaskHandle_t s_task = NULL;
 static app_http_config_t s_cfg = {0};
 static smartload_http_callbacks_t s_callbacks = {0};
 static char s_device_id[APP_CONFIG_STR_LEN] = {0};
-static bool s_conn_lookup_disabled = false;
+static bool s_conn_lookup_done = false;
+static bool s_config_pull_done = false;
+static bool s_cached_connection_applied = false;
 
 static esp_err_t smartload_http_event_handler(esp_http_client_event_t *evt)
 {
@@ -101,7 +103,10 @@ static void smartload_http_store_device_id(const char *device_id)
         ESP_LOGI(TAG, "HTTP device_id set: %s", device_id);
     }
     snprintf(s_device_id, sizeof(s_device_id), "%s", device_id);
-    (void)nvs_manager_set_str(SMARTLOAD_HTTP_NS, SMARTLOAD_HTTP_KEY_DEVICE_ID, s_device_id);
+    esp_err_t err = nvs_manager_set_str(SMARTLOAD_HTTP_NS, SMARTLOAD_HTTP_KEY_DEVICE_ID, s_device_id);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to persist HTTP device_id: %s", esp_err_to_name(err));
+    }
 }
 
 static int smartload_http_positive_or_default(int value, int fallback)
@@ -444,14 +449,39 @@ static esp_err_t smartload_http_parse_connection_payload(const char *body,
     return err;
 }
 
-static void smartload_http_process_connection_pull(const app_http_config_t *cfg)
+static esp_err_t smartload_http_apply_cached_connection(void)
 {
-    if (!cfg->conn_url[0] || s_conn_lookup_disabled) {
-        return;
+    char cached_connection[APP_CONFIG_URL_LEN + APP_CONFIG_STR_LEN] = {0};
+    app_config_azure_t azure_cfg = {0};
+
+    esp_err_t err = nvs_manager_get_str(SMARTLOAD_HTTP_NS,
+                                        SMARTLOAD_HTTP_KEY_CONN,
+                                        cached_connection,
+                                        sizeof(cached_connection));
+    if (err != ESP_OK || cached_connection[0] == '\0') {
+        return err != ESP_OK ? err : ESP_ERR_NOT_FOUND;
     }
 
-    /* Run once after Wi-Fi is connected (do not poll repeatedly). */
-    s_conn_lookup_disabled = true;
+    err = app_config_parse_connection_string(cached_connection, &azure_cfg);
+    if (err != ESP_OK || !app_config_validate_azure(&azure_cfg)) {
+        ESP_LOGW(TAG, "Cached az_conn invalid, ignoring");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    smartload_http_store_device_id(azure_cfg.device_id);
+    if (s_callbacks.on_connection_string) {
+        s_callbacks.on_connection_string(&azure_cfg);
+    }
+
+    ESP_LOGW(TAG, "Using cached Azure connection: azure_device_id=%s", azure_cfg.device_id);
+    return ESP_OK;
+}
+
+static void smartload_http_process_connection_pull(const app_http_config_t *cfg)
+{
+    if (!cfg->conn_url[0] || s_conn_lookup_done) {
+        return;
+    }
 
     char response[768];
     char connection_string[APP_CONFIG_URL_LEN + APP_CONFIG_STR_LEN];
@@ -468,10 +498,18 @@ static void smartload_http_process_connection_pull(const app_http_config_t *cfg)
                                                 sizeof(response),
                                                 &status);
     if (err != ESP_OK) {
+        if (!s_cached_connection_applied && smartload_http_apply_cached_connection() == ESP_OK) {
+            s_cached_connection_applied = true;
+            s_conn_lookup_done = true;
+            return;
+        }
+
         if (err == ESP_ERR_NOT_FOUND || status == 404) {
-            s_conn_lookup_disabled = true;
+            s_conn_lookup_done = true;
             ESP_LOGW(TAG, "Device-details lookup returned 404, keeping fallback device_id=%s",
                      s_device_id[0] ? s_device_id : "<unset>");
+        } else {
+            ESP_LOGW(TAG, "Device-details lookup failed, will retry: %s", esp_err_to_name(err));
         }
         return;
     }
@@ -512,6 +550,8 @@ static void smartload_http_process_connection_pull(const app_http_config_t *cfg)
     ESP_LOGI(TAG, "Stored Azure connection: azure_device_id=%s http_device_id=%s",
              azure_cfg.device_id[0] ? azure_cfg.device_id : "<unset>",
              s_device_id[0] ? s_device_id : "<unset>");
+    s_conn_lookup_done = true;
+    s_cached_connection_applied = false;
     if (s_callbacks.on_connection_string) {
         s_callbacks.on_connection_string(&azure_cfg);
     }
@@ -519,7 +559,7 @@ static void smartload_http_process_connection_pull(const app_http_config_t *cfg)
 
 static void smartload_http_process_config_pull(const app_http_config_t *cfg)
 {
-    if (!cfg->config_url[0]) {
+    if (!cfg->config_url[0] || s_config_pull_done) {
         return;
     }
 
@@ -537,7 +577,9 @@ static void smartload_http_process_config_pull(const app_http_config_t *cfg)
         err = smartload_http_apply_runtime_json(response);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "HTTP config apply failed: %s", esp_err_to_name(err));
+            return;
         }
+        s_config_pull_done = true;
     }
 }
 
@@ -622,17 +664,17 @@ static void smartload_http_task(void *arg)
         TickType_t cfg_ticks = pdMS_TO_TICKS((uint32_t)smartload_http_positive_or_default(cfg.config_interval_sec, 300) * 1000U);
         TickType_t conn_ticks = pdMS_TO_TICKS((uint32_t)smartload_http_positive_or_default(cfg.conn_interval_sec, 600) * 1000U);
 
-        if (cfg.conn_url[0] && (last_conn == 0 || (now - last_conn) >= conn_ticks)) {
-            smartload_http_process_connection_pull(&cfg);
-            last_conn = xTaskGetTickCount();
-        }
-
         smartload_http_queue_item_t item = {0};
         while (xQueueReceive(s_queue, &item, 0) == pdTRUE) {
             smartload_http_process_queue_item(&cfg, &item);
         }
 
-        if (cfg.config_url[0] && (last_cfg == 0 || (now - last_cfg) >= cfg_ticks)) {
+        if (cfg.conn_url[0] && !s_conn_lookup_done && (last_conn == 0 || (now - last_conn) >= conn_ticks)) {
+            smartload_http_process_connection_pull(&cfg);
+            last_conn = xTaskGetTickCount();
+        }
+
+        if (cfg.config_url[0] && !s_config_pull_done && (last_cfg == 0 || (now - last_cfg) >= cfg_ticks)) {
             smartload_http_process_config_pull(&cfg);
             last_cfg = xTaskGetTickCount();
         }
@@ -663,6 +705,9 @@ esp_err_t smartload_http_init(const app_http_config_t *cfg, const smartload_http
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_cfg = *cfg;
     s_callbacks = *callbacks;
+    s_conn_lookup_done = false;
+    s_config_pull_done = false;
+    s_cached_connection_applied = false;
     xSemaphoreGive(s_lock);
 
     storage_manager_init();
@@ -691,6 +736,9 @@ esp_err_t smartload_http_set_config(const app_http_config_t *cfg)
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_cfg = *cfg;
+    s_conn_lookup_done = false;
+    s_config_pull_done = false;
+    s_cached_connection_applied = false;
     xSemaphoreGive(s_lock);
     return ESP_OK;
 }

@@ -7,6 +7,7 @@
 #define STORAGE_SPIFFS_MOUNT "/spiffs"
 #define STORAGE_SD_MOUNT     "/sdcard"
 #define STORAGE_MAX_PATH_LEN 96
+#define STORAGE_WRITE_BLOCK_PCT 80
 #define STORAGE_USAGE_LIMIT_PCT 90
 
 typedef struct {
@@ -31,6 +32,7 @@ typedef struct {
 esp_err_t storage_init(void);
 void storage_set_sd_available(bool available);
 bool storage_sd_is_available(void);
+esp_err_t storage_read_from_mount(const char *mount, const char *path, char *buf, size_t buf_size, size_t *out_len);
 esp_err_t storage_read(const char *path, char *buf, size_t buf_size, size_t *out_len);
 esp_err_t storage_write(const char *path, const char *data);
 esp_err_t storage_remove(const char *path);

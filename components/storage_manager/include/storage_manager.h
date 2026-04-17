@@ -8,6 +8,8 @@
 
 #define STORAGE_MANAGER_HTTP_PREFIX "/http_"
 #define STORAGE_MANAGER_HTTP_KEEP_COUNT 8
+#define STORAGE_MANAGER_LOG_PREFIX "/log_"
+#define STORAGE_MANAGER_LOG_KEEP_COUNT 8
 
 typedef struct {
     int usage_percent;
