@@ -7,6 +7,7 @@ build/
 # Generated KConfig — one file per active environment, not committed
 sdkconfig
 sdkconfig.*
+!sdkconfig.smartload_new_pcb
 
 # IDE — VS Code (auto-generated, machine-specific)
 .vscode/

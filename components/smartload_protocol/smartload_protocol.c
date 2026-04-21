@@ -1,6 +1,8 @@
 #include "smartload_protocol.h"
 
 #include "esp_check.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 esp_err_t smartload_protocol_init(smartload_protocol_t *ctx, modbus_rtu_handle_t modbus, uint8_t slave_addr)
 {
@@ -15,10 +17,15 @@ esp_err_t smartload_read_status(smartload_protocol_t *ctx, smartload_status_t *o
     ESP_RETURN_ON_FALSE(ctx && out_status, ESP_ERR_INVALID_ARG, "smartload_protocol", "invalid args");
 
     uint16_t regs[17] = {0};
-    ESP_RETURN_ON_ERROR(
-        modbus_rtu_read_holding_registers(ctx->modbus, ctx->slave_addr, 0x0000, 17, regs),
-        "smartload_protocol",
-        "read status failed");
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        err = modbus_rtu_read_holding_registers(ctx->modbus, ctx->slave_addr, 0x0000, 17, regs);
+        if (err == ESP_OK) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    ESP_RETURN_ON_ERROR(err, "smartload_protocol", "read status failed");
 
     out_status->status_word = regs[0x00];
     out_status->delivery_volume_x100 = ((uint32_t)regs[0x01] << 16) | regs[0x03];
@@ -33,7 +40,15 @@ esp_err_t smartload_read_status(smartload_protocol_t *ctx, smartload_status_t *o
     out_status->alarm_register = regs[0x10];
 
     uint16_t flow = 0;
-    if (modbus_rtu_read_holding_registers(ctx->modbus, ctx->slave_addr, 0x0021, 1, &flow) == ESP_OK) {
+    err = ESP_FAIL;
+    for (int attempt = 1; attempt <= 2; attempt++) {
+        err = modbus_rtu_read_holding_registers(ctx->modbus, ctx->slave_addr, 0x0021, 1, &flow);
+        if (err == ESP_OK) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (err == ESP_OK) {
         out_status->flow_rate_x100 = flow;
     }
 

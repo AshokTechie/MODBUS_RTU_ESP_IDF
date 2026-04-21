@@ -1,12 +1,14 @@
 #include "app_config.h"
 #include "azure_iot.h"
 #include "board.h"
+#include "board_utils.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_netif_sntp.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "lora.h"
 #include "modbus_rtu.h"
 #include "nvs_manager.h"
 #include "nvs_flash.h"
@@ -30,9 +32,14 @@ static app_runtime_config_t s_runtime_cfg = {0};
 static app_http_config_t s_http_cfg = {0};
 static SemaphoreHandle_t s_modbus_lock = NULL;
 static SemaphoreHandle_t s_runtime_lock = NULL;
+static SemaphoreHandle_t s_cloud_lock = NULL;
+
+static app_config_azure_t s_active_azure_cfg = {0};
+static bool s_active_azure_cfg_set = false;
 
 static esp_err_t connect_azure_if_possible(const app_config_azure_t *override_cfg);
 static esp_err_t build_status_json(char *out, size_t out_size);
+static void cloud_init_task(void *arg);
 
 #define SMARTLOAD_HTTP_DEFAULT_POST_URL "https://shiftlogs.azurewebsites.net/api/atg_post"
 #define SMARTLOAD_HTTP_DEFAULT_CONN_URL_FMT "https://enterpriseiotro.azurewebsites.net/api/getDeviceDetails?chipID=%llu"
@@ -40,14 +47,14 @@ static esp_err_t build_status_json(char *out, size_t out_size);
 
 #define APP_CFG_NVS_NAMESPACE "smartload"
 #define WIFI_CFG_NVS_NAMESPACE "smartload_cfg"
-#define WIFI_CFG_NVS_LEGACY_NAMESPACE "rdu_cfg"
+static const char WIFI_CFG_NVS_COMPAT_NAMESPACE[] = { 0x72, 0x64, 0x75, 0x5f, 0x63, 0x66, 0x67, 0x00 };
 
 static void init_nvs_namespaces(void)
 {
     static const char *k_namespaces[] = {
         APP_CFG_NVS_NAMESPACE,
         WIFI_CFG_NVS_NAMESPACE,
-        WIFI_CFG_NVS_LEGACY_NAMESPACE,
+        WIFI_CFG_NVS_COMPAT_NAMESPACE,
     };
 
     for (size_t i = 0; i < (sizeof(k_namespaces) / sizeof(k_namespaces[0])); i++) {
@@ -164,16 +171,69 @@ static esp_err_t sync_time_via_ntp(void)
     return err;
 }
 
+static void lora_init_task(void *arg)
+{
+    (void)arg;
+
+    esp_err_t err = lora_init();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "LoRa init complete");
+    } else {
+        ESP_LOGW(TAG, "LoRa init failed: %s", esp_err_to_name(err));
+    }
+
+    vTaskDelete(NULL);
+}
+
+static void start_lora_init_task(void)
+{
+    TaskHandle_t task = NULL;
+    if (xTaskCreate(lora_init_task, "lora_init", 4096, NULL, 3, &task) != pdPASS) {
+        ESP_LOGW(TAG, "Unable to start LoRa init task");
+    }
+}
+
 static void on_twin_update(const app_runtime_config_t *cfg)
 {
     apply_runtime_config(cfg, "Twin");
 }
 
+static bool azure_cfg_equal(const app_config_azure_t *a, const app_config_azure_t *b)
+{
+    if (!a || !b) {
+        return false;
+    }
+    return (strcmp(a->hostname, b->hostname) == 0) &&
+           (strcmp(a->device_id, b->device_id) == 0) &&
+           (strcmp(a->shared_access_key, b->shared_access_key) == 0);
+}
+
 static void on_http_connection_update(const app_config_azure_t *cfg)
 {
     ESP_LOGI(TAG, "HTTP connection string refreshed for device=%s", cfg ? cfg->device_id : "<null>");
-    if (cfg && wifi_mgr_is_connected() && !azure_iot_is_connected()) {
+    if (!cfg || !wifi_mgr_is_connected()) {
+        return;
+    }
+
+    if (s_cloud_lock) {
+        xSemaphoreTake(s_cloud_lock, portMAX_DELAY);
+    }
+
+    bool same_identity = s_active_azure_cfg_set && azure_cfg_equal(cfg, &s_active_azure_cfg);
+    if (azure_iot_is_connected() && !same_identity) {
+        ESP_LOGW(TAG,
+                 "Azure identity changed while connected (old=%s new=%s). Reconnecting MQTT.",
+                 s_active_azure_cfg_set ? s_active_azure_cfg.device_id : "<unset>",
+                 cfg->device_id[0] ? cfg->device_id : "<unset>");
+        azure_iot_disconnect();
+    }
+
+    if (!azure_iot_is_connected()) {
         connect_azure_if_possible(cfg);
+    }
+
+    if (s_cloud_lock) {
+        xSemaphoreGive(s_cloud_lock);
     }
 }
 
@@ -368,13 +428,39 @@ static esp_err_t connect_azure_if_possible(const app_config_azure_t *override_cf
     }
 
     azure_iot_start_background_task();
+
+    s_active_azure_cfg = azure_cfg;
+    s_active_azure_cfg_set = true;
     ESP_LOGI(TAG, "Azure IoT connected and initialized");
     return ESP_OK;
+}
+
+static void cloud_init_task(void *arg)
+{
+    (void)arg;
+
+    /* Run cloud init off the main task stack to avoid stack overflow during TLS/MQTT setup. */
+    esp_err_t azure_err = connect_azure_if_possible(NULL);
+    if (azure_err != ESP_OK) {
+        if (azure_err == ESP_ERR_NOT_FOUND) {
+            ESP_LOGW(TAG, "Azure credentials missing, running local-only");
+        } else if (!wifi_mgr_is_connected()) {
+            ESP_LOGW(TAG, "Wi-Fi offline, Azure IoT features unavailable");
+        } else {
+            ESP_LOGW(TAG, "Azure IoT init/connect failed: %s", esp_err_to_name(azure_err));
+        }
+    }
+
+    vTaskDelete(NULL);
 }
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "HTTP provisioning chip_id fixed=%llu", (unsigned long long)SMARTLOAD_HTTP_PROVISION_CHIP_ID);
+    ESP_LOGI(TAG, "Board info: code=%s chip_id=%llu",
+             board_get_board_code(),
+             (unsigned long long)board_read_chip_id());
+
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -383,18 +469,19 @@ void app_main(void)
 
     init_nvs_namespaces();
 
-    ESP_ERROR_CHECK(board_init());
+    ESP_ERROR_CHECK(board_init_all());
     ESP_ERROR_CHECK(storage_init());
     ESP_ERROR_CHECK(storage_manager_init());
+    storage_set_sd_available(board_sd_is_mounted());
+
+    start_lora_init_task();
 
     s_modbus_lock = xSemaphoreCreateMutex();
     s_runtime_lock = xSemaphoreCreateMutex();
+    s_cloud_lock = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(s_modbus_lock ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(s_runtime_lock ? ESP_OK : ESP_ERR_NO_MEM);
-
-    if (board_init_sd() == ESP_OK) {
-        storage_set_sd_available(board_sd_is_mounted());
-    }
+    ESP_ERROR_CHECK(s_cloud_lock ? ESP_OK : ESP_ERR_NO_MEM);
 
     ESP_ERROR_CHECK(wifi_mgr_init());
     if (wifi_mgr_connect() == ESP_OK) {
@@ -408,9 +495,9 @@ void app_main(void)
         .tx_pin = BOARD_RS485_TX_GPIO,
         .rx_pin = BOARD_RS485_RX_GPIO,
         .de_pin = BOARD_RS485_EN_GPIO,
-        .re_pin = GPIO_NUM_NC,
+        .re_pin = BOARD_RS485_RE_GPIO,
         .baudrate = 9600,
-        .response_timeout_ms = 1000,
+        .response_timeout_ms = 2000,
         .debug = true,
     };
 
@@ -431,14 +518,8 @@ void app_main(void)
         ESP_LOGI(TAG, "SmartLoad HTTP disabled");
     }
 
-    esp_err_t azure_err = connect_azure_if_possible(NULL);
-    if (azure_err != ESP_OK) {
-        if (azure_err == ESP_ERR_NOT_FOUND) {
-            ESP_LOGW(TAG, "Azure credentials missing, running local-only");
-        } else if (!wifi_mgr_is_connected()) {
-            ESP_LOGW(TAG, "Wi-Fi offline, Azure IoT features unavailable");
-        }
-    }
+    /* Cloud init runs in its own task to protect the main stack. */
+    xTaskCreate(cloud_init_task, "cloud_init", 12288, NULL, 5, NULL);
 
     xTaskCreate(telemetry_task, "telemetry_task", 6144, NULL, 4, NULL);
 }

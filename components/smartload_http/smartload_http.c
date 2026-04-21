@@ -27,6 +27,8 @@ static const char *TAG = "smartload_http";
 #define SMARTLOAD_HTTP_NS "smartload"
 #define SMARTLOAD_HTTP_KEY_CONN "az_conn"
 #define SMARTLOAD_HTTP_KEY_DEVICE_ID "http_did"
+
+/* Per backend contract, the ingest API requires this exact device_id header for POST. */
 #define SMARTLOAD_HTTP_POST_DEVICE_ID "bpcl-788888-DU-1"
 
 typedef struct {
@@ -148,7 +150,10 @@ static esp_err_t smartload_http_perform_json_request(esp_http_client_method_t me
         .url = url,
         .method = method,
         .timeout_ms = 10000,
-        .max_authorization_retries = -1,
+        /* Prevent esp_http_client from internally retrying 401 flows in a way that can
+         * drop custom headers like "device_id". Our outer retry logic handles transport
+         * errors explicitly and never retries on HTTP 401. */
+        .max_authorization_retries = 0,
         .event_handler = smartload_http_event_handler,
         .user_data = &resp,
         .disable_auto_redirect = true,
@@ -591,7 +596,19 @@ static void smartload_http_process_queue_item(const app_http_config_t *cfg, cons
 
     char response[512];
     int status = 0;
-    const char *raw_post_device_id = SMARTLOAD_HTTP_POST_DEVICE_ID;
+    /* SmartLoad contract: POST device_id is reversed + base64 encoded.
+     * The raw value must come from backend provisioning if available. */
+    char raw_post_device_id[APP_CONFIG_STR_LEN] = {0};
+    if (s_lock) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        snprintf(raw_post_device_id,
+                 sizeof(raw_post_device_id),
+                 "%s",
+                 s_device_id[0] ? s_device_id : SMARTLOAD_HTTP_POST_DEVICE_ID);
+        xSemaphoreGive(s_lock);
+    } else {
+        snprintf(raw_post_device_id, sizeof(raw_post_device_id), "%s", SMARTLOAD_HTTP_POST_DEVICE_ID);
+    }
     char reversed_post_device_id[APP_CONFIG_STR_LEN] = {0};
     char post_device_id_b64[((APP_CONFIG_STR_LEN + 2) / 3) * 4 + 1] = {0};
     size_t raw_post_device_id_len = strlen(raw_post_device_id);

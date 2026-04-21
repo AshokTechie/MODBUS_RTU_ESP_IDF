@@ -1,6 +1,7 @@
 #include "azure_iot.h"
 
 #include "app_config.h"
+#include "board_utils.h"
 #include "cJSON.h"
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
@@ -8,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "mqtt_mgr.h"
 #include "ota.h"
@@ -43,6 +45,7 @@ static struct {
     char mqtt_username[320];
     char telemetry_topic[192];
     bool connected;
+    volatile bool stopping;
     TickType_t last_reconnect_tick;
     TickType_t last_pending_drain_tick;
     uint32_t pending_seq;
@@ -51,6 +54,30 @@ static struct {
 static TaskHandle_t s_bg_task = NULL;
 static azure_iot_twin_cb_t s_twin_cb = NULL;
 static azure_iot_method_cb_t s_method_cb = NULL;
+static SemaphoreHandle_t s_mutex = NULL;
+
+static void azure_iot_lock(void)
+{
+    if (s_mutex) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+    }
+}
+
+static void azure_iot_unlock(void)
+{
+    if (s_mutex) {
+        xSemaphoreGive(s_mutex);
+    }
+}
+
+static const char *boot_board_code(void)
+{
+#if defined(HARDWARE_NEW_PCB)
+    return "n";
+#else
+    return board_get_board_code();
+#endif
+}
 
 static esp_err_t build_sd_file_list_json(char *out, size_t out_size)
 {
@@ -194,11 +221,21 @@ static void save_pending_payload(const char *payload)
 
 static esp_err_t deliver_payload(const char *payload)
 {
-    if (s.connected && mqtt_mgr_is_connected()) {
-        int mid = mqtt_mgr_publish(s.telemetry_topic, payload, 1, 0);
-        if (mid >= 0) {
-            return ESP_OK;
-        }
+    bool mqtt_ok = false;
+    int mid = -1;
+
+    /* Prevent racing with reconnect/disconnect (which can surface as EOF/errno=119). */
+    azure_iot_lock();
+    mqtt_ok = (s.connected && mqtt_mgr_is_connected());
+    if (mqtt_ok) {
+        mid = mqtt_mgr_publish(s.telemetry_topic, payload, 1, 0);
+    }
+    azure_iot_unlock();
+
+    if (mqtt_ok && mid >= 0) {
+        return ESP_OK;
+    }
+    if (mqtt_ok) {
         ESP_LOGW(TAG, "MQTT publish returned %d, falling back to HTTP", mid);
     }
     return deliver_via_http(payload);
@@ -487,6 +524,9 @@ static void handle_direct_method(const char *topic, int topic_len, const char *d
 static void mqtt_event_bridge(const mqtt_mgr_event_t *event, void *user_ctx)
 {
     (void)user_ctx;
+    if (s.stopping) {
+        return;
+    }
     if (event->type == MQTT_MGR_EVENT_CONNECTED) {
         s.connected = true;
         ESP_LOGI(TAG, "MQTT connected: device_id=%s device_name=%s",
@@ -557,6 +597,12 @@ esp_err_t azure_iot_init(const app_config_azure_t *creds, const app_runtime_conf
     if (!creds || !runtime_cfg) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (!s_mutex) {
+        s_mutex = xSemaphoreCreateMutex();
+        if (!s_mutex) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
     memset(&s, 0, sizeof(s));
     s.creds = *creds;
     s.runtime_cfg = *runtime_cfg;
@@ -565,10 +611,14 @@ esp_err_t azure_iot_init(const app_config_azure_t *creds, const app_runtime_conf
              "%s/%s/?api-version=2021-04-12", s.creds.hostname, s.creds.device_id);
     snprintf(s.telemetry_topic, sizeof(s.telemetry_topic),
              "devices/%s/messages/events/", s.creds.device_id);
-    ESP_LOGI(TAG, "Azure init: device_id=%s device_name=%s host=%s",
+
+    uint64_t chip_id = board_read_chip_id();
+    ESP_LOGI(TAG, "Azure init: device_id=%s device_name=%s host=%s board=%s chip_id=%llu",
              s.creds.device_id,
              s.runtime_cfg.device_name[0] ? s.runtime_cfg.device_name : "<unset>",
-             s.creds.hostname);
+             s.creds.hostname,
+             boot_board_code(),
+             (unsigned long long)chip_id);
     return ESP_OK;
 }
 
@@ -584,9 +634,12 @@ void azure_iot_register_method_callback(azure_iot_method_cb_t cb)
 
 esp_err_t azure_iot_connect(void)
 {
+    azure_iot_lock();
+    s.stopping = false;
     uint64_t expiry = (uint64_t)time(NULL) + SAS_DURATION_SECS;
     if (sas_token_generate(s.creds.hostname, s.creds.device_id, s.creds.shared_access_key,
                            expiry, s.sas_token, sizeof(s.sas_token)) != 0) {
+        azure_iot_unlock();
         return ESP_FAIL;
     }
 
@@ -596,20 +649,38 @@ esp_err_t azure_iot_connect(void)
     snprintf(cfg.username, sizeof(cfg.username), "%s", s.mqtt_username);
     snprintf(cfg.password, sizeof(cfg.password), "%s", s.sas_token);
 
-    ESP_RETURN_ON_ERROR(mqtt_mgr_init(&cfg, mqtt_event_bridge, NULL), TAG, "mqtt_mgr_init failed");
-    ESP_RETURN_ON_ERROR(mqtt_mgr_connect(), TAG, "mqtt_mgr_connect failed");
+    esp_err_t err = mqtt_mgr_init(&cfg, mqtt_event_bridge, NULL);
+    if (err != ESP_OK) {
+        azure_iot_unlock();
+        ESP_LOGW(TAG, "mqtt_mgr_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = mqtt_mgr_connect();
+    if (err != ESP_OK) {
+        azure_iot_unlock();
+        ESP_LOGW(TAG, "mqtt_mgr_connect failed: %s", esp_err_to_name(err));
+        return err;
+    }
     s.last_reconnect_tick = xTaskGetTickCount();
+    azure_iot_unlock();
     return azure_iot_wait_until_connected(AZURE_CONNECT_TIMEOUT_MS);
 }
 
 esp_err_t azure_iot_disconnect(void)
 {
+    azure_iot_lock();
     s.connected = false;
+    s.stopping = true;
     if (!mqtt_mgr_is_connected()) {
-        return mqtt_mgr_destroy();
+        esp_err_t err = mqtt_mgr_destroy();
+        s.stopping = false;
+        azure_iot_unlock();
+        return err;
     }
     esp_err_t err = mqtt_mgr_disconnect();
     mqtt_mgr_destroy();
+    s.stopping = false;
+    azure_iot_unlock();
     return err;
 }
 
@@ -650,6 +721,14 @@ esp_err_t azure_iot_publish_telemetry(const char *payload_json)
         if (s.runtime_cfg.device_name[0] != '\0') {
             cJSON_AddStringToObject(root, "device_name", s.runtime_cfg.device_name);
         }
+
+        cJSON_AddStringToObject(root, "board_code", boot_board_code());
+
+        char chip_id_str[24];
+        snprintf(chip_id_str, sizeof(chip_id_str), "%llu",
+                 (unsigned long long)board_read_chip_id());
+        cJSON_AddStringToObject(root, "chip_id", chip_id_str);
+
         if (!cJSON_PrintPreallocated(root, payload, sizeof(payload), false)) {
             cJSON_Delete(root);
             return ESP_ERR_INVALID_SIZE;

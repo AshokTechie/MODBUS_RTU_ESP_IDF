@@ -14,6 +14,7 @@
 struct modbus_rtu_context {
     modbus_rtu_config_t cfg;
     SemaphoreHandle_t lock;
+    bool owns_uart_driver;
 };
 
 static const char *TAG = "modbus_rtu";
@@ -70,6 +71,16 @@ static esp_err_t receive_frame(modbus_rtu_handle_t handle, uint8_t *buffer, size
     while (total < 3) {
         read = uart_read_bytes(handle->cfg.uart_num, buffer + total, 3 - total, timeout);
         if (read <= 0) {
+            if (handle->cfg.debug) {
+                size_t buffered = 0;
+                (void)uart_get_buffered_data_len(handle->cfg.uart_num, &buffered);
+                ESP_LOGW(TAG,
+                         "RX timeout waiting header (read=%d total=%d buffered=%u). "
+                         "Likely wiring/baud/parity/DE-RE issue.",
+                         read,
+                         total,
+                         (unsigned)buffered);
+            }
             return ESP_ERR_TIMEOUT;
         }
         total += read;
@@ -94,6 +105,17 @@ static esp_err_t receive_frame(modbus_rtu_handle_t handle, uint8_t *buffer, size
                                expected - (size_t)total,
                                timeout);
         if (read <= 0) {
+            if (handle->cfg.debug) {
+                size_t buffered = 0;
+                (void)uart_get_buffered_data_len(handle->cfg.uart_num, &buffered);
+                ESP_LOGW(TAG,
+                         "RX timeout mid-frame (read=%d total=%d expected=%u buffered=%u)",
+                         read,
+                         total,
+                         (unsigned)expected,
+                         (unsigned)buffered);
+                ESP_LOG_BUFFER_HEXDUMP(TAG, buffer, (size_t)total, ESP_LOG_INFO);
+            }
             return ESP_ERR_TIMEOUT;
         }
         total += read;
@@ -116,6 +138,17 @@ esp_err_t modbus_rtu_init(const modbus_rtu_config_t *cfg, modbus_rtu_handle_t *o
 {
     ESP_RETURN_ON_FALSE(cfg && out_handle, ESP_ERR_INVALID_ARG, TAG, "invalid args");
     esp_err_t ret = ESP_OK;
+    bool uart_installed_here = false;
+
+    ESP_LOGI(TAG,
+             "Init: UART%d TX=%d RX=%d DE=%d RE=%d baud=%lu timeout_ms=%lu",
+             cfg->uart_num,
+             cfg->tx_pin,
+             cfg->rx_pin,
+             cfg->de_pin,
+             cfg->re_pin,
+             (unsigned long)cfg->baudrate,
+             (unsigned long)cfg->response_timeout_ms);
 
     modbus_rtu_handle_t handle = calloc(1, sizeof(*handle));
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_NO_MEM, TAG, "no memory");
@@ -125,6 +158,7 @@ esp_err_t modbus_rtu_init(const modbus_rtu_config_t *cfg, modbus_rtu_handle_t *o
         free(handle);
         return ESP_ERR_NO_MEM;
     }
+    handle->owns_uart_driver = false;
 
     uart_config_t uart_cfg = {
         .baud_rate = (int)cfg->baudrate,
@@ -135,9 +169,41 @@ esp_err_t modbus_rtu_init(const modbus_rtu_config_t *cfg, modbus_rtu_handle_t *o
         .source_clk = UART_SCLK_DEFAULT,
     };
 
-    ESP_GOTO_ON_ERROR(uart_driver_install(cfg->uart_num, 1024, 0, 0, NULL, 0), fail, TAG, "uart_driver_install failed");
-    ESP_GOTO_ON_ERROR(uart_param_config(cfg->uart_num, &uart_cfg), fail, TAG, "uart_param_config failed");
-    ESP_GOTO_ON_ERROR(uart_set_pin(cfg->uart_num, cfg->tx_pin, cfg->rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE), fail, TAG, "uart_set_pin failed");
+    /* UART ownership is the board layer. If a driver is already installed (e.g., by board_init_rs485),
+     * reuse it and avoid re-install/re-config that can conflict. */
+    bool already_installed = uart_is_driver_installed(cfg->uart_num);
+    if (!already_installed) {
+        ret = uart_driver_install(cfg->uart_num, 1024, 0, 0, NULL, 0);
+        if (ret == ESP_OK) {
+            uart_installed_here = true;
+            handle->owns_uart_driver = true;
+        }
+        ESP_GOTO_ON_ERROR(ret, fail, TAG, "uart_driver_install failed");
+
+        ESP_GOTO_ON_ERROR(uart_param_config(cfg->uart_num, &uart_cfg), fail, TAG, "uart_param_config failed");
+        ESP_GOTO_ON_ERROR(uart_set_pin(cfg->uart_num, cfg->tx_pin, cfg->rx_pin,
+                                       UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE),
+                          fail, TAG, "uart_set_pin failed");
+    } else {
+        ESP_LOGI(TAG, "UART%d driver already installed; Modbus RTU will reuse it", cfg->uart_num);
+    }
+
+    /* Even when we reuse a pre-installed driver (board layer), enforce the expected pins and
+     * serial framing here, otherwise Modbus can silently inherit mismatched config. */
+    ESP_GOTO_ON_ERROR(uart_param_config(cfg->uart_num, &uart_cfg), fail, TAG, "uart_param_config failed (reuse)");
+    ESP_GOTO_ON_ERROR(uart_set_pin(cfg->uart_num, cfg->tx_pin, cfg->rx_pin,
+                                   UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE),
+                      fail, TAG, "uart_set_pin failed (reuse)");
+    (void)uart_flush_input(cfg->uart_num);
+
+    if (cfg->de_pin < 0 && cfg->re_pin < 0) {
+        ESP_LOGW(TAG,
+                 "RS485 DE/RE pins not configured. If your transceiver requires direction control, "
+                 "Modbus will timeout. (TX=%d RX=%d UART%d)",
+                 cfg->tx_pin,
+                 cfg->rx_pin,
+                 cfg->uart_num);
+    }
 
     if (cfg->de_pin >= 0) {
         gpio_set_direction(cfg->de_pin, GPIO_MODE_OUTPUT);
@@ -155,7 +221,9 @@ fail:
     if (handle->lock) {
         vSemaphoreDelete(handle->lock);
     }
-    uart_driver_delete(cfg->uart_num);
+    if (uart_installed_here) {
+        uart_driver_delete(cfg->uart_num);
+    }
     free(handle);
     return ret;
 }
@@ -165,7 +233,9 @@ void modbus_rtu_deinit(modbus_rtu_handle_t handle)
     if (!handle) {
         return;
     }
-    uart_driver_delete(handle->cfg.uart_num);
+    if (handle->owns_uart_driver) {
+        uart_driver_delete(handle->cfg.uart_num);
+    }
     if (handle->lock) {
         vSemaphoreDelete(handle->lock);
     }

@@ -16,6 +16,14 @@
 
 static const char *TAG = "wifi_mgr";
 
+#ifndef DEFAULT_WIFI_SSID
+#define DEFAULT_WIFI_SSID ""
+#endif
+
+#ifndef DEFAULT_WIFI_PASS
+#define DEFAULT_WIFI_PASS ""
+#endif
+
 #define WIFI_CFG_NAMESPACE_PRIMARY "smartload_cfg"
 static const char WIFI_CFG_NAMESPACE_LEGACY[] = { 0x72, 0x64, 0x75, 0x5f, 0x63, 0x66, 0x67, 0x00 };
 
