@@ -50,16 +50,22 @@ uint64_t board_read_chip_id(void)
 
     return chip_id;
 }
-
 const char *board_get_board_code(void)
 {
 #if defined(HARDWARE_NEW_PCB)
     return "n";
+#elif defined(HARDWARE_ORPACK)
+    return "o";
+#elif defined(HARDWARE_RELCON)
+    return "r";
+#elif defined(HARDWARE_EVIDEN)
+    return "e";
+#elif defined(HARDWARE_ESP32DEV) || defined(LILYGO_ESP32_CLASSIC)
+    return "l";
 #else
     return "u";
 #endif
 }
-
 bool board_rtc_health(esp_err_t *err_out)
 {
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();

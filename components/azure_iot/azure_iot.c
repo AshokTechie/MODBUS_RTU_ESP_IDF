@@ -74,8 +74,16 @@ static const char *boot_board_code(void)
 {
 #if defined(HARDWARE_NEW_PCB)
     return "n";
+#elif defined(HARDWARE_ORPACK)
+    return "o";
+#elif defined(HARDWARE_RELCON)
+    return "r";
+#elif defined(HARDWARE_EVIDEN)
+    return "e";
+#elif defined(HARDWARE_ESP32DEV) || defined(LILYGO_ESP32_CLASSIC)
+    return "l";
 #else
-    return board_get_board_code();
+    return "u";
 #endif
 }
 
