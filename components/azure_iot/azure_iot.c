@@ -521,6 +521,36 @@ static void handle_direct_method(const char *topic, int topic_len, const char *d
         return;
     }
 
+    /* SmartLoad control commands (handled by app callback, but declared explicitly here). */
+    if (strcmp(method, "smartload_authorize") == 0 ||
+        strcmp(method, "smartload_start_batch") == 0 ||
+        strcmp(method, "smartload_stop_batch") == 0 ||
+        strcmp(method, "smartload_end_transaction") == 0 ||
+        strcmp(method, "smartload_clear_status") == 0 ||
+        strcmp(method, "smartload_clear_alarms") == 0) {
+        if (!s_method_cb) {
+            send_method_response(rid,
+                                 501,
+                                 "{\"ok\":false,\"err\":\"ESP_ERR_INVALID_STATE\",\"response\":\"method_handler_not_registered\"}");
+            return;
+        }
+
+        response[0] = '\0';
+        status = 200;
+        esp_err_t err = s_method_cb(method, payload, response, sizeof(response), &status);
+        if (err == ESP_OK) {
+            send_method_response(rid, status, response[0] ? response : "{\"ok\":true,\"response\":\"ok\"}");
+        } else {
+            char fail[192];
+            snprintf(fail,
+                     sizeof(fail),
+                     "{\"ok\":false,\"err\":\"%s\",\"response\":\"handler_failed\"}",
+                     esp_err_to_name(err));
+            send_method_response(rid, 500, fail);
+        }
+        return;
+    }
+
     if (s_method_cb && s_method_cb(method, payload, response, sizeof(response), &status) == ESP_OK) {
         send_method_response(rid, status, response);
         return;

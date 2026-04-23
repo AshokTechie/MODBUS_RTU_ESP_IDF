@@ -32,7 +32,7 @@
 #define HAS_RS485_SE            1
 #define PIN_5V_EN               16
 #define HAS_5V_EN               1
-#define RS485_EN_ALWAYS_HIGH    1
+#define RS485_EN_ALWAYS_HIGH    0
 #define RS485_USE_UART_RS485_MODE 0
 
 /* SD card (SPI mode) */

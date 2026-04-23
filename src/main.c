@@ -33,6 +33,8 @@ static app_http_config_t s_http_cfg = {0};
 static SemaphoreHandle_t s_modbus_lock = NULL;
 static SemaphoreHandle_t s_runtime_lock = NULL;
 static SemaphoreHandle_t s_cloud_lock = NULL;
+static volatile bool s_quick_test_running = false;
+static volatile bool s_quick_test_done = false;
 
 static app_config_azure_t s_active_azure_cfg = {0};
 static bool s_active_azure_cfg_set = false;
@@ -159,6 +161,225 @@ static esp_err_t smartload_send_simple_locked(esp_err_t (*fn)(smartload_protocol
     return err;
 }
 
+static esp_err_t smartload_send_all_control_commands_locked(size_t *out_sent)
+{
+    static const smartload_command_t k_cmds[] = {
+        SMARTLOAD_CMD_AUTHORIZE,
+        SMARTLOAD_CMD_START_BATCH,
+        SMARTLOAD_CMD_STOP_BATCH,
+        SMARTLOAD_CMD_END_TRANSACTION,
+        SMARTLOAD_CMD_CLEAR_STATUS,
+        SMARTLOAD_CMD_CLEAR_ALARMS,
+    };
+
+    if (out_sent) {
+        *out_sent = 0;
+    }
+
+    xSemaphoreTake(s_modbus_lock, portMAX_DELAY);
+    for (size_t i = 0; i < (sizeof(k_cmds) / sizeof(k_cmds[0])); i++) {
+        esp_err_t err = smartload_send_command(&s_smartload, k_cmds[i]);
+        if (err != ESP_OK) {
+            xSemaphoreGive(s_modbus_lock);
+            return err;
+        }
+        if (out_sent) {
+            (*out_sent)++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    xSemaphoreGive(s_modbus_lock);
+    return ESP_OK;
+}
+
+static void smartload_status_bits_to_text(uint16_t status, char *out, size_t out_size)
+{
+    if (!out || out_size == 0) {
+        return;
+    }
+
+    out[0] = '\0';
+    bool first = true;
+    struct {
+        uint16_t bit;
+        const char *name;
+    } flags[] = {
+        { SMARTLOAD_STATUS_READY, "Ready" },
+        { SMARTLOAD_STATUS_AUTHORIZED, "Auth" },
+        { SMARTLOAD_STATUS_DELIVERING, "Delivering" },
+        { SMARTLOAD_STATUS_BATCH_ACTIVE, "Batch" },
+        { SMARTLOAD_STATUS_ALARM_PRI, "AlarmPri" },
+        { SMARTLOAD_STATUS_ALARM_SEC, "AlarmSec" },
+    };
+
+    for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+        if ((status & flags[i].bit) == 0) {
+            continue;
+        }
+        if (!first) {
+            strlcat(out, ", ", out_size);
+        }
+        strlcat(out, flags[i].name, out_size);
+        first = false;
+    }
+
+    if (first) {
+        strlcpy(out, "none", out_size);
+    }
+}
+
+static esp_err_t smartload_log_full_register_block_locked(void)
+{
+    uint16_t regs[17] = {0};
+    ESP_RETURN_ON_ERROR(
+        modbus_rtu_read_holding_registers(s_smartload.modbus, s_smartload.slave_addr, 0x0000, 17, regs),
+        TAG,
+        "FC03 full block failed");
+
+    uint16_t status = regs[0x00];
+    uint32_t delivery_volume_x100 = ((uint32_t)regs[0x01] << 16) | regs[0x02];
+    uint32_t delivery_amount_x100 = ((uint32_t)regs[0x03] << 16) | regs[0x04];
+    uint32_t unit_price_x10000 = ((uint32_t)regs[0x05] << 16) | regs[0x06];
+    uint16_t flow_rate_x100 = regs[0x0D];
+
+    uint16_t dev_fw[2] = {0};
+    ESP_RETURN_ON_ERROR(
+        modbus_rtu_read_holding_registers(s_smartload.modbus, s_smartload.slave_addr, 0x0064, 2, dev_fw),
+        TAG,
+        "FC03 device info failed");
+
+    char status_bits[96] = {0};
+    smartload_status_bits_to_text(status, status_bits, sizeof(status_bits));
+
+    char dev_id[3] = {
+        (char)((dev_fw[0] >> 8) & 0xFF),
+        (char)(dev_fw[0] & 0xFF),
+        '\0',
+    };
+    uint8_t fw_major = (uint8_t)((dev_fw[1] >> 8) & 0xFF);
+    uint8_t fw_minor = (uint8_t)(dev_fw[1] & 0xFF);
+
+    ESP_LOGI(TAG, "Delivery Volume -> %.2f L", delivery_volume_x100 / 100.0f);
+    ESP_LOGI(TAG, "Delivery Amount -> %.2f", delivery_amount_x100 / 100.0f);
+    ESP_LOGI(TAG, "Unit Price -> %.4f", unit_price_x10000 / 10000.0f);
+    ESP_LOGI(TAG, "Flow Rate -> %.2f L/min", flow_rate_x100 / 100.0f);
+    ESP_LOGI(TAG, "Device ID -> '%s'", dev_id);
+    ESP_LOGI(TAG, "FW Version -> v%u.%02u", fw_major, fw_minor);
+    return ESP_OK;
+}
+
+static esp_err_t smartload_read_flow_locked(float *out_lpm)
+{
+    uint16_t flow = 0;
+    ESP_RETURN_ON_ERROR(
+        modbus_rtu_read_holding_registers(s_smartload.modbus, s_smartload.slave_addr, 0x000D, 1, &flow),
+        TAG,
+        "FC03 flow read failed");
+    if (out_lpm) {
+        *out_lpm = flow / 100.0f;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t smartload_quick_test_flow_locked(void)
+{
+    xSemaphoreTake(s_modbus_lock, portMAX_DELAY);
+
+    ESP_LOGI(TAG, "FC03 - READ COMMANDS");
+    ESP_LOGI(TAG, "Read Full Register Block (0x0000, 17 regs)");
+    esp_err_t err = smartload_log_full_register_block_locked();
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_modbus_lock);
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Read Device ID (0x0064 -> 'SL')");
+    uint16_t dev = 0;
+    err = modbus_rtu_read_holding_registers(s_smartload.modbus, s_smartload.slave_addr, 0x0064, 1, &dev);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_modbus_lock);
+        return err;
+    }
+    ESP_LOGI(TAG, "Decoded: '%c%c'", (char)((dev >> 8) & 0xFF), (char)(dev & 0xFF));
+
+    ESP_LOGI(TAG, "Read Flow Rate (0x000D)");
+    float flow_lpm = 0.0f;
+    err = smartload_read_flow_locked(&flow_lpm);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_modbus_lock);
+        return err;
+    }
+    ESP_LOGI(TAG, "Decoded flow before start: %.2f L/min", flow_lpm);
+
+    ESP_LOGI(TAG, "FC10 - WRITE COMMANDS (CONTROL)");
+    ESP_LOGI(TAG, "Authorize (0x0004)");
+    err = smartload_send_command(&s_smartload, SMARTLOAD_CMD_AUTHORIZE);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_modbus_lock);
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Start Batch (0x0006)");
+    err = smartload_send_command(&s_smartload, SMARTLOAD_CMD_START_BATCH);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_modbus_lock);
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Read Flow Rate (0x000D) after start");
+    err = smartload_read_flow_locked(&flow_lpm);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_modbus_lock);
+        return err;
+    }
+    ESP_LOGI(TAG, "Decoded flow after start: %.2f L/min", flow_lpm);
+
+    ESP_LOGI(TAG, "Stop Batch (0x0007)");
+    err = smartload_send_command(&s_smartload, SMARTLOAD_CMD_STOP_BATCH);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_modbus_lock);
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Read Flow Rate (0x000D) after stop");
+    err = smartload_read_flow_locked(&flow_lpm);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_modbus_lock);
+        return err;
+    }
+    ESP_LOGI(TAG, "Decoded flow after stop: %.2f L/min", flow_lpm);
+
+    ESP_LOGI(TAG, "End Transaction (0x0009)");
+    err = smartload_send_command(&s_smartload, SMARTLOAD_CMD_END_TRANSACTION);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_modbus_lock);
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Clear Status (0x000A)");
+    err = smartload_send_command(&s_smartload, SMARTLOAD_CMD_CLEAR_STATUS);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_modbus_lock);
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Clear Alarms (0x000B)");
+    err = smartload_send_command(&s_smartload, SMARTLOAD_CMD_CLEAR_ALARMS);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_modbus_lock);
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Readback summary");
+    err = smartload_log_full_register_block_locked();
+    xSemaphoreGive(s_modbus_lock);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return ESP_OK;
+}
+
 static esp_err_t sync_time_via_ntp(void)
 {
     if (time(NULL) > 1704067200) {
@@ -273,6 +494,10 @@ static esp_err_t smartload_method_handler(const char *method,
         return ESP_ERR_INVALID_ARG;
     }
 
+    if (!payload_json) {
+        payload_json = "";
+    }
+
     if (strcmp(method, "smartload_read_status") == 0) {
         esp_err_t err = build_status_json(response_json, response_json_size);
         *status_code = err == ESP_OK ? 200 : 500;
@@ -281,35 +506,79 @@ static esp_err_t smartload_method_handler(const char *method,
 
     if (strcmp(method, "smartload_clear_status") == 0) {
         esp_err_t err = smartload_send_simple_locked(smartload_clear_status);
-        snprintf(response_json, response_json_size, "{\"response\":\"%s\"}", err == ESP_OK ? "status cleared" : "clear failed");
+        snprintf(response_json,
+                 response_json_size,
+                 "{\"ok\":%s,\"command\":\"clear_status\",\"err\":\"%s\"}",
+                 err == ESP_OK ? "true" : "false",
+                 esp_err_to_name(err));
         *status_code = err == ESP_OK ? 200 : 500;
         return err;
     }
 
     if (strcmp(method, "smartload_clear_alarms") == 0) {
         esp_err_t err = smartload_send_simple_locked(smartload_clear_alarms);
-        snprintf(response_json, response_json_size, "{\"response\":\"%s\"}", err == ESP_OK ? "alarms cleared" : "clear failed");
+        snprintf(response_json,
+                 response_json_size,
+                 "{\"ok\":%s,\"command\":\"clear_alarms\",\"err\":\"%s\"}",
+                 err == ESP_OK ? "true" : "false",
+                 esp_err_to_name(err));
         *status_code = err == ESP_OK ? 200 : 500;
         return err;
     }
 
     if (strcmp(method, "smartload_start_batch") == 0) {
         esp_err_t err = smartload_send_simple_locked(smartload_start_batch);
-        snprintf(response_json, response_json_size, "{\"response\":\"%s\"}", err == ESP_OK ? "batch started" : "start failed");
+        snprintf(response_json,
+                 response_json_size,
+                 "{\"ok\":%s,\"command\":\"start_batch\",\"err\":\"%s\"}",
+                 err == ESP_OK ? "true" : "false",
+                 esp_err_to_name(err));
         *status_code = err == ESP_OK ? 200 : 500;
         return err;
     }
 
     if (strcmp(method, "smartload_stop_batch") == 0) {
         esp_err_t err = smartload_send_simple_locked(smartload_stop_batch);
-        snprintf(response_json, response_json_size, "{\"response\":\"%s\"}", err == ESP_OK ? "batch stopped" : "stop failed");
+        snprintf(response_json,
+                 response_json_size,
+                 "{\"ok\":%s,\"command\":\"stop_batch\",\"err\":\"%s\"}",
+                 err == ESP_OK ? "true" : "false",
+                 esp_err_to_name(err));
         *status_code = err == ESP_OK ? 200 : 500;
         return err;
     }
 
     if (strcmp(method, "smartload_end_transaction") == 0) {
         esp_err_t err = smartload_send_simple_locked(smartload_end_transaction);
-        snprintf(response_json, response_json_size, "{\"response\":\"%s\"}", err == ESP_OK ? "transaction ended" : "end failed");
+        snprintf(response_json,
+                 response_json_size,
+                 "{\"ok\":%s,\"command\":\"end_transaction\",\"err\":\"%s\"}",
+                 err == ESP_OK ? "true" : "false",
+                 esp_err_to_name(err));
+        *status_code = err == ESP_OK ? 200 : 500;
+        return err;
+    }
+
+    if (strcmp(method, "smartload_send_all_commands") == 0) {
+        size_t sent = 0;
+        esp_err_t err = smartload_send_all_control_commands_locked(&sent);
+        snprintf(response_json,
+                 response_json_size,
+                 "{\"ok\":%s,\"command\":\"send_all_commands\",\"err\":\"%s\",\"sent\":%u,\"expected\":6}",
+                 err == ESP_OK ? "true" : "false",
+                 esp_err_to_name(err),
+                 (unsigned)sent);
+        *status_code = err == ESP_OK ? 200 : 500;
+        return err;
+    }
+
+    if (strcmp(method, "smartload_quick_test_flow") == 0) {
+        esp_err_t err = smartload_quick_test_flow_locked();
+        snprintf(response_json,
+                 response_json_size,
+                 "{\"ok\":%s,\"command\":\"quick_test_flow\",\"err\":\"%s\"}",
+                 err == ESP_OK ? "true" : "false",
+                 esp_err_to_name(err));
         *status_code = err == ESP_OK ? 200 : 500;
         return err;
     }
@@ -334,8 +603,9 @@ static esp_err_t smartload_method_handler(const char *method,
         }
         esp_err_t err = smartload_auth_batch_locked(preset_volume_x100, components);
         snprintf(response_json, response_json_size,
-                 "{\"response\":\"%s\",\"preset_volume_x100\":%lu,\"components\":%u}",
-                 err == ESP_OK ? "batch authorized" : "batch authorize failed",
+                 "{\"ok\":%s,\"command\":\"auth_batch\",\"err\":\"%s\",\"preset_volume_x100\":%lu,\"components\":%u}",
+                 err == ESP_OK ? "true" : "false",
+                 esp_err_to_name(err),
                  (unsigned long)preset_volume_x100,
                  (unsigned)components);
         *status_code = err == ESP_OK ? 200 : 500;
@@ -357,7 +627,14 @@ static esp_err_t smartload_method_handler(const char *method,
             cJSON_Delete(root);
         }
         esp_err_t err = smartload_authorize_locked(recipe, additive, side_nozzle);
-        snprintf(response_json, response_json_size, "{\"response\":\"%s\"}", err == ESP_OK ? "authorized" : "authorize failed");
+        snprintf(response_json,
+                 response_json_size,
+                 "{\"ok\":%s,\"command\":\"authorize\",\"err\":\"%s\",\"recipe\":%u,\"additive_config\":%u,\"side_nozzle\":%u}",
+                 err == ESP_OK ? "true" : "false",
+                 esp_err_to_name(err),
+                 (unsigned)recipe,
+                 (unsigned)additive,
+                 (unsigned)side_nozzle);
         *status_code = err == ESP_OK ? 200 : 500;
         return err;
     }
@@ -370,7 +647,11 @@ static void telemetry_task(void *arg)
     (void)arg;
     char payload[768];
 
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    /* Keep boot logs focused on quick-test FC03/FC10 sequence first. */
+    while (!s_quick_test_done) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
 
     for (;;) {
         app_runtime_config_t runtime_cfg = {0};
@@ -454,6 +735,47 @@ static void cloud_init_task(void *arg)
     vTaskDelete(NULL);
 }
 
+static void quick_test_autorun_task(void *arg)
+{
+    (void)arg;
+
+    /* Wait briefly so boot-time network/storage activity settles before Modbus burst. */
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    s_quick_test_running = true;
+
+    /* Wait until device starts responding, so quick-test output appears as a clean sequence. */
+    esp_err_t ready_err = ESP_FAIL;
+    for (int i = 0; i < 20; i++) {
+        uint16_t status_word = 0;
+        xSemaphoreTake(s_modbus_lock, portMAX_DELAY);
+        ready_err = modbus_rtu_read_holding_registers(s_smartload.modbus,
+                                                      s_smartload.slave_addr,
+                                                      0x0000,
+                                                      1,
+                                                      &status_word);
+        xSemaphoreGive(s_modbus_lock);
+        if (ready_err == ESP_OK) {
+            ESP_LOGI(TAG, "quick-test link ready (status=0x%04X)", status_word);
+            break;
+        }
+        ESP_LOGW(TAG, "quick-test waiting for simulator (%d/20): %s", i + 1, esp_err_to_name(ready_err));
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+
+    ESP_LOGI(TAG, "starting smartload_test_flow");
+    esp_err_t err = smartload_quick_test_flow_locked();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "smartload_test_flow completed");
+    } else {
+        ESP_LOGE(TAG, "smartload_test_flow failed: %s", esp_err_to_name(err));
+    }
+
+    s_quick_test_running = false;
+    s_quick_test_done = true;
+    vTaskDelete(NULL);
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "HTTP provisioning chip_id fixed=%llu", (unsigned long long)SMARTLOAD_HTTP_PROVISION_CHIP_ID);
@@ -501,6 +823,18 @@ void app_main(void)
         .debug = true,
     };
 
+    ESP_LOGI(TAG,
+             "Modbus direction mode: %s (DE=%d RE=%d)",
+#if RS485_EN_ALWAYS_HIGH
+             "board-fixed-high",
+#elif RS485_USE_UART_RS485_MODE
+             "uart-rs485",
+#else
+             "manual-toggle",
+#endif
+             modbus_cfg.de_pin,
+             modbus_cfg.re_pin);
+
     ESP_ERROR_CHECK(modbus_rtu_init(&modbus_cfg, &s_modbus));
     ESP_ERROR_CHECK(smartload_protocol_init(&s_smartload, s_modbus, 0x01));
 
@@ -520,6 +854,9 @@ void app_main(void)
 
     /* Cloud init runs in its own task to protect the main stack. */
     xTaskCreate(cloud_init_task, "cloud_init", 12288, NULL, 5, NULL);
+
+    /* Run quick Modbus validation sequence automatically once at boot. */
+    xTaskCreate(quick_test_autorun_task, "quick_test", 6144, NULL, 4, NULL);
 
     xTaskCreate(telemetry_task, "telemetry_task", 6144, NULL, 4, NULL);
 }
