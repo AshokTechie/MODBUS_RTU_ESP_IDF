@@ -201,6 +201,18 @@ esp_err_t board_init_rs485(void)
     }
 #endif
 
+#if RS485_USE_UART_RS485_MODE
+    ESP_LOGI(TAG, "RS485 step 3b: enabling UART RS485 half-duplex mode...");
+    err = uart_set_mode(RS485_UART_NUM, UART_MODE_RS485_HALF_DUPLEX);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "RS485 UART set mode FAILED: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "RS485 step 3b: UART RS485 mode enabled");
+#else
+    (void)uart_set_mode(RS485_UART_NUM, UART_MODE_UART);
+#endif
+
 #if RS485_EN_PIN >= 0
     gpio_config_t en_cfg = {
         .pin_bit_mask = 1ULL << RS485_EN_PIN,

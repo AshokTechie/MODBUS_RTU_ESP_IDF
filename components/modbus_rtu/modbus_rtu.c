@@ -335,12 +335,21 @@ esp_err_t modbus_rtu_init(const modbus_rtu_config_t *cfg, modbus_rtu_handle_t *o
     (void)uart_flush_input(cfg->uart_num);
 
     if (cfg->de_pin < 0 && cfg->re_pin < 0) {
+#if RS485_USE_UART_RS485_MODE
+        ESP_LOGI(TAG,
+                 "RS485 DE/RE pins not configured; using UART RS485 half-duplex direction control. "
+                 "(TX=%d RX=%d UART%d)",
+                 cfg->tx_pin,
+                 cfg->rx_pin,
+                 cfg->uart_num);
+#else
         ESP_LOGW(TAG,
                  "RS485 DE/RE pins not configured. If your transceiver requires direction control, "
                  "Modbus will timeout. (TX=%d RX=%d UART%d)",
                  cfg->tx_pin,
                  cfg->rx_pin,
                  cfg->uart_num);
+#endif
     }
 
     if (cfg->de_pin >= 0) {

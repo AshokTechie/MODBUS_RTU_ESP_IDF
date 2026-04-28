@@ -181,6 +181,7 @@
 /* RS485 - no EN pin on this board */
 #define RS485_TX_PIN            17
 #define RS485_RX_PIN            18
+#define RS485_USE_UART_RS485_MODE 1
 
 /* SD card (SPI mode) */
 #define SD_MISO_PIN             13
